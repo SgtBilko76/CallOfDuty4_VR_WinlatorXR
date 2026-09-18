@@ -14,6 +14,7 @@
 #include "vr/vr_prompt_labels.h"
 #include "vr/vr_weapon_calibration.h"
 #include "vr/vr_weapon_profiles.h"
+#include "vr/vr_winlatorxr_protocol.h"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +39,7 @@ namespace vpost = kisak::vr::postfx;
 namespace vsaved = kisak::vr::saved_screen;
 namespace vp = kisak::vr::prompts;
 namespace vwp = kisak::vr::weapon_profiles;
+namespace vwxr = kisak::vr::winlatorxr;
 
 namespace
 {
@@ -116,10 +118,108 @@ std::size_t CountOccurrences(
     return count;
 }
 
+void RunWinlatorXrProtocolTests()
+{
+    // Sample captured from a Quest 3 by the HWXR reference mod.
+    const std::string sample =
+        "client0 0.213 0.287 -0.933 0.035 0.0 0.0 -0.008 -0.229 -0.173 "
+        "0.095 -0.296 0.947 -0.077 0.0 0.0 0.154 -0.240 -0.140 "
+        "0.146 -0.072 0.048 0.985 0.037 0.006 -0.017 0.0678 99.00 103.40 "
+        "224 TFFFFFFFFFTTTFFFFFT";
+
+    vwxr::Packet packet;
+    Check(vwxr::ParsePacket(sample, &packet), "WinlatorXR sample packet should parse");
+    Check(packet.client == "client0", "WinlatorXR client label should be preserved");
+    Check(packet.leftOrientation[2] == -0.933f, "WinlatorXR left quaternion order");
+    Check(packet.rightPosition[0] == 0.154f, "WinlatorXR right position order");
+    Check(packet.headOrientation[3] == 0.985f, "WinlatorXR head quaternion order");
+    Check(packet.headPosition[2] == -0.017f, "WinlatorXR head position order");
+    Check(std::fabs(packet.ipdMeters - 0.0678f) < 1e-6f, "WinlatorXR IPD is meters");
+    Check(packet.fovXDegrees == 99.0f && packet.fovYDegrees == 103.4f, "WinlatorXR FOV order");
+    Check(packet.sync == 224, "WinlatorXR sync value");
+    Check(
+        packet.Pressed(vwxr::Button::LeftGrip) &&
+            !packet.Pressed(vwxr::Button::LeftMenu) &&
+            packet.Pressed(vwxr::Button::RightA) &&
+            packet.Pressed(vwxr::Button::RightB) &&
+            packet.Pressed(vwxr::Button::RightGrip) &&
+            packet.Pressed(vwxr::Button::RightTrigger) &&
+            !packet.Pressed(vwxr::Button::LeftTrigger),
+        "WinlatorXR button order");
+    Check(!packet.extendedValid && !packet.modeFlagsValid, "WinlatorXR legacy packet has no 0.5 extras");
+
+    const std::string extended =
+        sample.substr(std::string("client0 ").size()) +
+        " 1.62 0 0 0 1 0.1 0.2 0.3 0.9 TF";
+    Check(vwxr::ParsePacket(extended, &packet), "WinlatorXR 0.5 packet without client label should parse");
+    Check(packet.client.empty(), "WinlatorXR packet without client label");
+    Check(
+        packet.extendedValid &&
+            packet.headAltitudeMeters == 1.62f &&
+            packet.leftGripOrientation[3] == 1.0f &&
+            packet.rightGripOrientation[0] == 0.1f,
+        "WinlatorXR 0.5 altitude and grip poses");
+    Check(packet.modeFlagsValid && packet.immersive && !packet.sideBySide, "WinlatorXR 0.5 mode flags");
+
+    Check(vwxr::ParsePacket(sample.substr(0, sample.size() - 25u), &packet) == false, "WinlatorXR truncated packet is rejected");
+    Check(!vwxr::ParsePacket("client0 nan" + sample.substr(13), &packet), "WinlatorXR non-finite packet is rejected");
+
+    vwxr::StatePacket state;
+    state.leftHapticFrames = 3.0f;
+    state.fovXDegrees = 99.0f;
+    state.fovYDegrees = 103.4f;
+    Check(
+        vwxr::FormatStatePacket(state) == "3.000 0.000 1 1 99.000 103.400",
+        "WinlatorXR state packet format");
+    Check(vwxr::SyncPixelRed(224) == 224u && vwxr::SyncPixelRed(257) == 1u, "WinlatorXR sync pixel wraps");
+
+    const vwxr::SystemInfo quest3 = vwxr::ParseSystemInfo(
+        "Oculus\r\nEUREKA\r\n14\r\n2025-01-01\r\n1920x1080\r\n");
+    Check(
+        quest3.manufacturer == "Oculus" && quest3.product == "EUREKA" &&
+            quest3.screenWidth == 1920 && quest3.screenHeight == 1080,
+        "WinlatorXR system info parsing");
+    Check(!vwxr::DefaultControllerRollFlip(quest3), "Quest 3 keeps the controller basis");
+    Check(
+        vwxr::DefaultControllerRollFlip(vwxr::ParseSystemInfo("Oculus\nHOLLYWOOD\n")),
+        "Quest 2 flips the controller basis");
+
+    Check(vwxr::ParsePacket(sample, &packet), "WinlatorXR sample packet should parse again");
+    packet.leftThumbstick = {0.0f, 0.9f};
+    packet.buttons[static_cast<std::size_t>(vwxr::Button::LeftMenu)] = true;
+    const vwxr::Hands hands = vwxr::HandsFromPacket(packet);
+    bool active = false;
+    Check(
+        vwxr::GetBooleanSourceState(hands, vi::Source::LeftSqueeze, &active) && active,
+        "WinlatorXR left grip resolves as squeeze");
+    Check(
+        vwxr::GetBooleanSourceState(hands, vi::Source::RightSecondary, &active) && active,
+        "WinlatorXR B resolves as right secondary");
+    Check(
+        vwxr::GetBooleanSourceState(hands, vi::Source::LeftMenu, &active) && active,
+        "WinlatorXR left menu resolves separately from Y");
+    Check(
+        !vwxr::GetBooleanSourceState(hands, vi::Source::LeftSecondary, &active) && active,
+        "WinlatorXR Y is not aliased to menu");
+    Check(
+        !vwxr::GetBooleanSourceState(hands, vi::Source::LeftThumbrestTouch, &active) && !active,
+        "WinlatorXR has no thumbrest source");
+    Check(
+        vwxr::GetBooleanSourceState(hands, vi::Source::LeftPrimaryAxisUp, &active) && active,
+        "WinlatorXR stick direction resolves from the analog axis");
+    const vi::OpenVrVector2 stick =
+        vwxr::GetVector2SourceState(hands, vi::Source::LeftPrimaryAxis, &active);
+    Check(active && stick.y == 0.9f, "WinlatorXR primary axis is the thumbstick");
+    vwxr::GetVector2SourceState(hands, vi::Source::LeftTrackpad, &active);
+    Check(!active, "WinlatorXR has no trackpad axis");
+}
+
 } // namespace
 
 int main(const int argumentCount, char** arguments)
 {
+    RunWinlatorXrProtocolTests();
+
     {
         Check(
             !vsaved::ShouldCaptureFullPackedFrame(

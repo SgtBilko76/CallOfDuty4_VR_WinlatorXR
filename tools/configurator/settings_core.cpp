@@ -203,10 +203,10 @@ const std::vector<SettingDefinition> kCatalog = {
     Choice(
         "KISAK_VR_BACKEND",
         "Runtime backend",
-        "Auto tries OpenXR first and falls back to the experimental 32-bit OpenVR path.",
+        "Auto uses WinlatorXR inside a WinlatorXR container, otherwise tries OpenXR first and falls back to the experimental 32-bit OpenVR path.",
         SettingPage::Quick,
         "auto",
-        {{"auto", "Automatic"}, {"openxr", "OpenXR only"}, {"openvr", "OpenVR fallback"}}),
+        {{"auto", "Automatic"}, {"openxr", "OpenXR only"}, {"openvr", "OpenVR fallback"}, {"winlatorxr", "WinlatorXR (standalone Quest/Pico)"}}),
     Choice(
         "KISAK_VR_UNIT_SYSTEM",
         "Measurement units",

@@ -108,6 +108,8 @@ add_executable(
     ../../src/vr/vr_prompt_labels.h
     ../../src/vr/vr_weapon_profiles.cpp
     ../../src/vr/vr_weapon_profiles.h
+    ../../src/vr/vr_winlatorxr_protocol.cpp
+    ../../src/vr/vr_winlatorxr_protocol.h
 )
 
 target_include_directories(

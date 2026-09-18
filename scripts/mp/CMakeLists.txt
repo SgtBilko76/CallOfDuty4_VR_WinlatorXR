@@ -76,6 +76,10 @@ target_sources(
         ${SRC_DIR}/vr/vr_prompt_labels.h
         ${SRC_DIR}/vr/vr_weapon_profiles.cpp
         ${SRC_DIR}/vr/vr_weapon_profiles.h
+        ${SRC_DIR}/vr/vr_winlatorxr.cpp
+        ${SRC_DIR}/vr/vr_winlatorxr.h
+        ${SRC_DIR}/vr/vr_winlatorxr_protocol.cpp
+        ${SRC_DIR}/vr/vr_winlatorxr_protocol.h
         ${SRC_DIR}/vr/vr_d3d9ex_interop_probe.cpp
         ${SRC_DIR}/vr/vr_d3d9ex_interop_probe.h
         ${SRC_DIR}/vr/vr_openxr.h

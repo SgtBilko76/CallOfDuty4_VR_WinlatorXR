@@ -10,6 +10,7 @@
 #include "vr/vr_prompt_labels.h"
 #include "vr/vr_weapon_calibration.h"
 #include "vr/vr_weapon_profiles.h"
+#include "vr/vr_winlatorxr.h"
 #include "client/client.h"
 
 void __cdecl UI_MouseEvent(int localClientNum, int x, int y);
@@ -60,6 +61,7 @@ namespace VrInteractions = kisak::vr::interactions;
 namespace VrPackedLayout = kisak::vr::packed_layout;
 namespace VrPrompts = kisak::vr::prompts;
 namespace VrWeaponProfiles = kisak::vr::weapon_profiles;
+namespace VrWinlatorXr = kisak::vr::winlatorxr;
 
 constexpr XrViewConfigurationType kViewConfiguration =
     XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -76,11 +78,14 @@ bool g_vrCalibrationFloorSpaceAvailable = false;
 // only a 64-bit OpenXR runtime, but SteamVR still supplies the architecture-
 // matched 32-bit OpenVR client. Keep the working OpenXR path primary and use
 // OpenVR only when requested or when OpenXR cannot enumerate a runtime.
+// WinlatorXR (standalone Quest/Pico via a Wine container) exposes neither
+// runtime; it is selected explicitly or when its exchange folder exists.
 enum class VrRuntimeBackend : std::uint32_t
 {
     None = 0u,
     OpenXr,
     OpenVr,
+    WinlatorXr,
 };
 
 VrRuntimeBackend g_vrRuntimeBackend =
@@ -120,6 +125,32 @@ bool g_vrOpenVrLoggedMissionSelector = false;
 VrInput::OpenVrMissionSelectorState
     g_vrOpenXrMissionSelector = {};
 bool g_vrOpenXrLoggedMissionSelector = false;
+
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// XrAPI state. Poses are converted to the same OpenXR-convention views and
+// controller poses that the OpenVR adapter publishes, so gameplay code is
+// shared. The packed D3D9 backbuffer is presented directly to the window.
+bool g_vrWinlatorXrInitialized = false;
+VrWinlatorXr::Hands g_vrWinlatorXrHands = {};
+VrInput::OpenVrMissionSelectorState
+    g_vrWinlatorXrMissionSelector = {};
+bool g_vrWinlatorXrLoggedMissionSelector = false;
+bool g_vrWinlatorXrLoggedFirstPacket = false;
+bool g_vrWinlatorXrLoggedStall = false;
+std::uint64_t g_vrWinlatorXrLoggedRejectedCount = 0u;
+int g_vrWinlatorXrLastSync = -1;
+bool g_vrWinlatorXrControllerRollFlip = false;
+bool g_vrWinlatorXrFloorRelative = false;
+float g_vrWinlatorXrFovXDegrees = 0.0f;
+float g_vrWinlatorXrFovYDegrees = 0.0f;
+bool g_vrWinlatorXrFovOverridden = false;
+std::array<float, 2> g_vrWinlatorXrPendingHapticFrames = {};
+std::array<XrVector3f, 2> g_vrWinlatorXrPreviousControllerPosition = {};
+std::array<bool, 2> g_vrWinlatorXrPreviousControllerPositionValid = {};
+std::uint64_t g_vrWinlatorXrPreviousPacketNanoseconds = 0u;
+// HMD_SYNC of the pose published with g_vrPublishedRenderViews; guarded by
+// g_vrPublishedRenderViewsMutex.
+int g_vrPublishedWinlatorXrSync = 0;
 
 // KISAK_SP_VR_OPENVR_SEMANTIC_CONTROLLER_POSES_V77
 // OpenVR's tracked-device pose is the driver's controller origin, not a
@@ -2034,7 +2065,22 @@ const VrConfiguratorSettings& VR_GetConfiguratorSettings()
         return loaded;
     }();
 
+    // WinlatorXR has no thumbrest either, so it takes the same upgrade.
     static bool openVrCompatibilityChecked = false;
+    if (!openVrCompatibilityChecked &&
+        g_vrRuntimeBackend == VrRuntimeBackend::WinlatorXr)
+    {
+        openVrCompatibilityChecked = true;
+        if (VR_ApplyOpenVrSafeBindingCompatibility(&settings))
+        {
+            Com_Printf(
+                0,
+                "[VR][WINLATORXR][CONTROLS] V105 upgraded the untouched "
+                "portable defaults to the safe off-hand trigger selector "
+                "because XrAPI has no thumbrest.\n");
+        }
+    }
+
     if (!openVrCompatibilityChecked &&
         g_vrRuntimeBackend == VrRuntimeBackend::OpenVr)
     {
@@ -2540,6 +2586,8 @@ const char* VR_RuntimeBackendName()
             return "OpenXR";
         case VrRuntimeBackend::OpenVr:
             return "OpenVR/SteamVR";
+        case VrRuntimeBackend::WinlatorXr:
+            return "WinlatorXR";
         default:
             return "none";
     }
@@ -15623,6 +15671,22 @@ void VR_ResetState()
     g_vrOpenVrLoggedMissionSelector = false;
     g_vrOpenXrMissionSelector = {};
     g_vrOpenXrLoggedMissionSelector = false;
+    g_vrWinlatorXrInitialized = false;
+    g_vrWinlatorXrHands = {};
+    g_vrWinlatorXrMissionSelector = {};
+    g_vrWinlatorXrLoggedMissionSelector = false;
+    g_vrWinlatorXrLoggedFirstPacket = false;
+    g_vrWinlatorXrLoggedStall = false;
+    g_vrWinlatorXrLoggedRejectedCount = 0u;
+    g_vrWinlatorXrLastSync = -1;
+    g_vrWinlatorXrControllerRollFlip = false;
+    g_vrWinlatorXrFloorRelative = false;
+    g_vrWinlatorXrFovXDegrees = 0.0f;
+    g_vrWinlatorXrFovYDegrees = 0.0f;
+    g_vrWinlatorXrFovOverridden = false;
+    g_vrWinlatorXrPendingHapticFrames = {};
+    g_vrWinlatorXrPreviousControllerPositionValid = {};
+    g_vrWinlatorXrPreviousPacketNanoseconds = 0u;
     g_vrOpenVrControllerPoseComponents = {};
     g_vrNightVisionVisorGesture = {};
     g_vrLoggedNightVisionVisorGesture = false;
@@ -15784,6 +15848,7 @@ void VR_RecordRenderFramePose(
     std::array<XrView, kVrStereoEyeCount>
         renderViews = {};
     std::uint64_t recordedNanoseconds = 0u;
+    int winlatorXrSync = 0;
 
     {
         std::lock_guard<std::mutex> lock(
@@ -15799,6 +15864,15 @@ void VR_RecordRenderFramePose(
             g_vrPublishedRenderPoseNanoseconds != 0u
                 ? g_vrPublishedRenderPoseNanoseconds
                 : VR_OpenXrClockNanoseconds();
+        winlatorXrSync = g_vrPublishedWinlatorXrSync;
+    }
+
+    if (g_vrRuntimeBackend ==
+        VrRuntimeBackend::WinlatorXr)
+    {
+        VrWinlatorXr::RecordRenderFrameSync(
+            renderFrameId,
+            winlatorXrSync);
     }
 
     std::lock_guard<std::mutex> lock(
@@ -19099,6 +19173,23 @@ bool VR_ApplyControllerRoleHaptic(
             : VrInteractions::OffHandControllerIndex(
                   configurable.dominantHand);
 
+    if (g_vrRuntimeBackend == VrRuntimeBackend::WinlatorXr)
+    {
+        // XrAPI carries only a vibration length in frames, so weaker
+        // effects become shorter pulses.
+        constexpr float kWinlatorXrHapticFramesPerSecond = 72.0f;
+        const float frames =
+            (std::max)(
+                1.0f,
+                durationSeconds *
+                    kWinlatorXrHapticFramesPerSecond *
+                    clampedAmplitude);
+        float& pending =
+            g_vrWinlatorXrPendingHapticFrames[controllerIndex];
+        pending = (std::max)(pending, frames);
+        return true;
+    }
+
     if (g_vrRuntimeBackend == VrRuntimeBackend::OpenVr)
     {
         const VrInput::OpenVrHandState& hand =
@@ -20493,6 +20584,20 @@ bool VR_MeasureFloorReferencedEyeHeight(
 
         // OpenVR is configured with TrackingUniverseStanding, whose Y=0
         // plane is the SteamVR floor.
+        meters = g_vrLatestHeadPosition.y;
+    }
+    else if (g_vrRuntimeBackend == VrRuntimeBackend::WinlatorXr)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_vrHeadOrientationMutex);
+
+        // Floor-referenced only when XrAPI 0.5 reports HMD_ALTITUDE.
+        if (!g_vrLatestHeadPositionValid ||
+            !g_vrWinlatorXrFloorRelative)
+        {
+            return false;
+        }
+
         meters = g_vrLatestHeadPosition.y;
     }
     else if (g_vrRuntimeBackend == VrRuntimeBackend::OpenXr &&
@@ -22261,6 +22366,311 @@ bool VR_InitOpenVrFallback(
     return true;
 }
 
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+float VR_ReadWinlatorXrFloatSetting(
+    const char* const name,
+    const float minimum,
+    const float maximum)
+{
+    const char* const requested = std::getenv(name);
+    if (requested == nullptr || requested[0] == '\0')
+    {
+        return 0.0f;
+    }
+
+    char* parseEnd = nullptr;
+    const float parsed = std::strtof(requested, &parseEnd);
+
+    if (parseEnd == requested ||
+        parseEnd == nullptr ||
+        parseEnd[0] != '\0' ||
+        !std::isfinite(parsed) ||
+        parsed < minimum ||
+        parsed > maximum)
+    {
+        Com_PrintWarning(
+            0,
+            "[VR][WINLATORXR] Ignoring invalid %s='%s'; valid range is "
+            "%.0f through %.0f.\n",
+            name,
+            requested,
+            minimum,
+            maximum);
+        return 0.0f;
+    }
+
+    return parsed;
+}
+
+// XrAPI reports one symmetric horizontal and vertical FOV per eye, and
+// WinlatorXR stretches each half of the window across the FOV we send back.
+bool VR_ConfigureWinlatorXrViews(
+    const float fovXDegrees,
+    const float fovYDegrees)
+{
+    constexpr float kMinimumFovDegrees = 30.0f;
+    constexpr float kMaximumFovDegrees = 170.0f;
+    constexpr float kDegreesToRadians = 0.01745329251994329577f;
+
+    if (!std::isfinite(fovXDegrees) ||
+        !std::isfinite(fovYDegrees) ||
+        fovXDegrees < kMinimumFovDegrees ||
+        fovXDegrees > kMaximumFovDegrees ||
+        fovYDegrees < kMinimumFovDegrees ||
+        fovYDegrees > kMaximumFovDegrees)
+    {
+        Com_PrintWarning(
+            0,
+            "[VR][WINLATORXR] Rejected FOV %.2f x %.2f degrees.\n",
+            fovXDegrees,
+            fovYDegrees);
+        return false;
+    }
+
+    const float halfX = 0.5f * fovXDegrees * kDegreesToRadians;
+    const float halfY = 0.5f * fovYDegrees * kDegreesToRadians;
+
+    VrEyeProjectionTangents tangents;
+    tangents.left = -std::tan(halfX);
+    tangents.right = std::tan(halfX);
+    tangents.down = -std::tan(halfY);
+    tangents.up = std::tan(halfY);
+
+    g_vrViews.resize(kVrStereoEyeCount);
+
+    for (XrView& view : g_vrViews)
+    {
+        const XrPosef pose = view.pose;
+        view = XrView{XR_TYPE_VIEW};
+        view.pose = pose;
+        if (view.pose.orientation.x == 0.0f &&
+            view.pose.orientation.y == 0.0f &&
+            view.pose.orientation.z == 0.0f &&
+            view.pose.orientation.w == 0.0f)
+        {
+            view.pose.orientation.w = 1.0f;
+        }
+        view.fov.angleLeft = -halfX;
+        view.fov.angleRight = halfX;
+        view.fov.angleDown = -halfY;
+        view.fov.angleUp = halfY;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_vrProjectionMutex);
+
+        g_vrEyeProjectionTangents = {tangents, tangents};
+        g_vrEyeProjectionValid = true;
+    }
+
+    g_vrWinlatorXrFovXDegrees = fovXDegrees;
+    g_vrWinlatorXrFovYDegrees = fovYDegrees;
+    g_vrLoggedProjectionPublish = true;
+
+    Com_Printf(
+        0,
+        "[VR][WINLATORXR] Published symmetric eye FOV %.2f x %.2f "
+        "degrees (tangents %.4f x %.4f, eye aspect %.4f).\n",
+        fovXDegrees,
+        fovYDegrees,
+        tangents.right,
+        tangents.up,
+        tangents.right / tangents.up);
+
+    return true;
+}
+
+void VR_SendWinlatorXrState()
+{
+    VrWinlatorXr::StatePacket state;
+    state.leftHapticFrames =
+        g_vrWinlatorXrPendingHapticFrames[VR_CONTROLLER_LEFT];
+    state.rightHapticFrames =
+        g_vrWinlatorXrPendingHapticFrames[VR_CONTROLLER_RIGHT];
+    state.vrMode = VrWinlatorXr::VrMode::Immersive;
+    state.stereoMode = VrWinlatorXr::StereoMode::SideBySide;
+    state.fovXDegrees = g_vrWinlatorXrFovXDegrees;
+    state.fovYDegrees = g_vrWinlatorXrFovYDegrees;
+
+    VrWinlatorXr::SendState(state);
+    g_vrWinlatorXrPendingHapticFrames = {};
+}
+
+bool VR_InitWinlatorXr(
+    const char* const reason)
+{
+    Com_Printf(
+        0,
+        "[VR][WINLATORXR] Starting the XrAPI backend: %s\n",
+        reason != nullptr ? reason : "requested");
+
+    std::string startError;
+    if (!VrWinlatorXr::Start(&startError))
+    {
+        std::snprintf(
+            g_vrLastStartupError.data(),
+            g_vrLastStartupError.size(),
+            "WinlatorXR XrAPI startup failed: %s",
+            startError.c_str());
+        return false;
+    }
+
+    // WinlatorXR begins streaming after it reads Z:\tmp\xr\version. Keep
+    // announcing immersive side-by-side mode until the first packet arrives.
+    const float requestedTimeoutMilliseconds =
+        VR_ReadWinlatorXrFloatSetting(
+            "KISAK_VR_WINLATORXR_STARTUP_TIMEOUT_MS",
+            1000.0f,
+            120000.0f);
+    const std::uint64_t timeoutNanoseconds =
+        static_cast<std::uint64_t>(
+            requestedTimeoutMilliseconds > 0.0f
+                ? requestedTimeoutMilliseconds
+                : 15000.0f) *
+        1000000ull;
+    const std::uint64_t startNanoseconds =
+        VR_OpenXrClockNanoseconds();
+
+    VrWinlatorXr::Packet packet;
+    bool received = false;
+
+    while (!received &&
+           VR_OpenXrClockNanoseconds() - startNanoseconds <
+               timeoutNanoseconds)
+    {
+        VR_SendWinlatorXrState();
+        bool fresh = false;
+        received = VrWinlatorXr::WaitForPacket(
+            -1,
+            500u,
+            &packet,
+            &fresh);
+    }
+
+    if (!received)
+    {
+        VrWinlatorXr::Stop();
+        std::snprintf(
+            g_vrLastStartupError.data(),
+            g_vrLastStartupError.size(),
+            "WinlatorXR sent no XrAPI tracking data to 127.0.0.1:7872 "
+            "within %.0f seconds. Enable the XR API for this container "
+            "in WinlatorXR and start the game in VR mode.",
+            static_cast<double>(timeoutNanoseconds) / 1.0e9);
+        return false;
+    }
+
+    const float fovXOverride =
+        VR_ReadWinlatorXrFloatSetting(
+            "KISAK_VR_WINLATORXR_FOV_X",
+            30.0f,
+            170.0f);
+    const float fovYOverride =
+        VR_ReadWinlatorXrFloatSetting(
+            "KISAK_VR_WINLATORXR_FOV_Y",
+            30.0f,
+            170.0f);
+
+    g_vrWinlatorXrFovOverridden =
+        fovXOverride > 0.0f || fovYOverride > 0.0f;
+
+    if (!VR_ConfigureWinlatorXrViews(
+            fovXOverride > 0.0f ? fovXOverride : packet.fovXDegrees,
+            fovYOverride > 0.0f ? fovYOverride : packet.fovYDegrees))
+    {
+        VrWinlatorXr::Stop();
+        std::snprintf(
+            g_vrLastStartupError.data(),
+            g_vrLastStartupError.size(),
+            "WinlatorXR reported an unusable FOV (%.2f x %.2f degrees). "
+            "Set KISAK_VR_WINLATORXR_FOV_X and _FOV_Y.",
+            packet.fovXDegrees,
+            packet.fovYDegrees);
+        return false;
+    }
+
+    const VrWinlatorXr::SystemInfo& system =
+        VrWinlatorXr::GetSystemInfo();
+
+    const char* const flipSetting =
+        std::getenv("KISAK_VR_WINLATORXR_FLIP_CONTROLLERS");
+    g_vrWinlatorXrControllerRollFlip =
+        flipSetting != nullptr && flipSetting[0] != '\0'
+            ? std::strcmp(flipSetting, "0") != 0
+            : VrWinlatorXr::DefaultControllerRollFlip(system);
+
+    std::snprintf(
+        g_vrCompatibilityRuntimeName.data(),
+        g_vrCompatibilityRuntimeName.size(),
+        "WinlatorXR XrAPI");
+    std::snprintf(
+        g_vrCompatibilityHeadsetName.data(),
+        g_vrCompatibilityHeadsetName.size(),
+        "%s %s",
+        system.manufacturer.empty()
+            ? "unknown"
+            : system.manufacturer.c_str(),
+        system.product.c_str());
+
+    // XrAPI exposes Touch-style buttons on every supported headset.
+    for (auto& profile : g_vrCompatibilityControllerProfiles)
+    {
+        std::snprintf(
+            profile.data(),
+            profile.size(),
+            "/interaction_profiles/oculus/touch_controller");
+    }
+
+    g_vrRuntimeBackend =
+        VrRuntimeBackend::WinlatorXr;
+    g_vrWinlatorXrInitialized = true;
+    g_vrWinlatorXrLastSync = -1;
+
+    VR_D3D9SetDirectPresentEnabled(true);
+
+    g_vrInitialized = true;
+    g_vrSessionRunning = true;
+    g_vrSessionState =
+        XR_SESSION_STATE_FOCUSED;
+    g_vrLastStartupError[0] = '\0';
+
+    KisakCrash_SetVrState(
+        true,
+        true,
+        static_cast<int>(
+            g_vrSessionState),
+        0u,
+        0u,
+        0u);
+
+    VR_UpdatePackedUiScreenPlacement();
+
+    const float eyeAspect =
+        std::tan(0.5f * g_vrWinlatorXrFovXDegrees * 0.01745329251994329577f) /
+        std::tan(0.5f * g_vrWinlatorXrFovYDegrees * 0.01745329251994329577f);
+
+    Com_Printf(
+        0,
+        "[VR][WINLATORXR] Backend ready: headset '%s', controller roll "
+        "flip %s, floor-relative tracking %s. Run fullscreen with an "
+        "r_customMode of about %dx%d so each window half matches the eye "
+        "aspect %.3f.\n",
+        g_vrCompatibilityHeadsetName.data(),
+        g_vrWinlatorXrControllerRollFlip ? "on" : "off",
+        packet.extendedValid ? "on" : "off (XrAPI < 0.5)",
+        system.screenHeight > 0
+            ? 2 * static_cast<int>(
+                std::lround(system.screenHeight * eyeAspect))
+            : 2 * static_cast<int>(std::lround(1080.0f * eyeAspect)),
+        system.screenHeight > 0 ? system.screenHeight : 1080,
+        eyeAspect);
+
+    VR_AppendCompatibilityRuntimeReceipt();
+
+    return true;
+}
+
 bool VR_Init()
 {
     g_vrLastStartupError[0] = '\0';
@@ -22313,6 +22723,7 @@ bool VR_Init()
 
     bool forceOpenXr = false;
     bool forceOpenVr = false;
+    bool forceWinlatorXr = false;
 
     if (requestedBackend != nullptr &&
         requestedBackend[0] != '\0' &&
@@ -22324,15 +22735,35 @@ bool VR_Init()
         forceOpenVr =
             _stricmp(requestedBackend, "openvr") == 0;
 
-        if (!forceOpenXr && !forceOpenVr)
+        forceWinlatorXr =
+            _stricmp(requestedBackend, "winlatorxr") == 0;
+
+        if (!forceOpenXr && !forceOpenVr && !forceWinlatorXr)
         {
             Com_PrintWarning(
                 0,
                 "[VR][STARTUP] Ignoring unknown "
                 "KISAK_VR_BACKEND='%s'; valid values are "
-                "auto, openxr, and openvr.\n",
+                "auto, openxr, openvr, and winlatorxr.\n",
                 requestedBackend);
         }
+    }
+
+    // KISAK_SP_VR_WINLATORXR_XRAPI_V1
+    // Inside a WinlatorXR container neither OpenXR nor SteamVR exists, so
+    // probe for its exchange folder before the PC runtimes.
+    if (forceWinlatorXr)
+    {
+        return VR_InitWinlatorXr(
+            "selected by KISAK_VR_BACKEND=winlatorxr.");
+    }
+
+    if (!forceOpenXr &&
+        !forceOpenVr &&
+        VrWinlatorXr::IsContainerDetected())
+    {
+        return VR_InitWinlatorXr(
+            "detected the WinlatorXR Z:\\tmp\\xr\\system file.");
     }
 
     Com_Printf(
@@ -22930,71 +23361,22 @@ bool VR_LocateOpenVrControllerComponentPose(
     return true;
 }
 
-bool VR_UpdateOpenVrControllerActions()
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// Resolves the configured bindings from per-hand controller snapshots. The
+// legacy SteamVR adapter and WinlatorXR both lack OpenXR actions and a
+// thumbrest, so they share this resolver and the V105 off-hand trigger
+// mission selector. Each backend supplies its own source readers.
+template <typename BooleanReader, typename VectorReader>
+void VR_ApplyLegacyControllerBindings(
+    const BooleanReader& readBoolean,
+    const VectorReader& readVector,
+    VrInput::OpenVrMissionSelectorState* const missionSelectorState,
+    bool* const loggedMissionSelector,
+    const char* const logPrefix,
+    const char* const backendLabel,
+    bool* const supportGripHeld,
+    bool* const objectGripHeld)
 {
-    if (g_vrOpenVrSystem == nullptr)
-    {
-        return false;
-    }
-
-    const std::array<VrInput::Hand, 2> handTypes = {
-        VrInput::Hand::Left,
-        VrInput::Hand::Right,
-    };
-
-    bool anyController = false;
-
-    for (std::size_t handIndex = 0u;
-         handIndex < handTypes.size();
-         ++handIndex)
-    {
-        const bool stateValid =
-            VrInput::RefreshOpenVrHandState(
-                g_vrOpenVrSystem,
-                handTypes[handIndex],
-                &g_vrOpenVrHands[handIndex]);
-
-        anyController = anyController || stateValid;
-
-        if (stateValid &&
-            !g_vrOpenVrLoggedController[handIndex])
-        {
-            const std::string description =
-                VrInput::OpenVrHandDescription(
-                    g_vrOpenVrHands[handIndex]);
-
-            Com_Printf(
-                0,
-                "[VR][OPENVR][CONTROLS] Connected %s. Legacy "
-                "SteamVR component discovery is active.\n",
-                description.c_str());
-
-            if (VrInput::IsOpenVrIndexController(
-                    g_vrOpenVrHands[handIndex]))
-            {
-                Com_Printf(
-                    0,
-                    "[VR][OPENVR][CONTROLS] V98 Index physical "
-                    "squeeze accepts either analog Axis2 or its "
-                    "digital press bit.\n");
-            }
-
-            std::snprintf(
-                g_vrCompatibilityControllerProfiles[handIndex].data(),
-                g_vrCompatibilityControllerProfiles[handIndex].size(),
-                "%s",
-                description.c_str());
-
-            g_vrOpenVrLoggedController[handIndex] = true;
-            VR_AppendCompatibilityRuntimeReceipt();
-        }
-        else if (!stateValid)
-        {
-            g_vrOpenVrLoggedController[handIndex] = false;
-            g_vrOpenVrControllerPoseComponents[handIndex] = {};
-        }
-    }
-
     VrInputHeldState inputHeld = {};
     VrInputVectorState inputVectors = {};
     VrInputActiveState inputVectorActive = {};
@@ -23017,25 +23399,22 @@ bool VR_UpdateOpenVrControllerActions()
 
     bool missionModifierActive = false;
     const bool missionModifierHeld =
-        VrInput::GetOpenVrBooleanSourceState(
-            g_vrOpenVrHands,
+        readBoolean(
             missionModifierSource,
             &missionModifierActive);
     bool missionSelectionAxisActive = false;
     const VrInput::OpenVrVector2 missionSelectionAxisValue =
-        VrInput::GetOpenVrVector2SourceState(
-            g_vrOpenVrHands,
+        readVector(
             missionSelectionAxis,
             &missionSelectionAxisActive);
     bool missionCancelAxisActive = false;
     const VrInput::OpenVrVector2 missionCancelAxisValue =
-        VrInput::GetOpenVrVector2SourceState(
-            g_vrOpenVrHands,
+        readVector(
             missionCancelAxis,
             &missionCancelAxisActive);
     const VrInput::OpenVrMissionSelectorUpdate missionSelector =
         VrInput::UpdateOpenVrMissionSelector(
-            &g_vrOpenVrMissionSelector,
+            missionSelectorState,
             missionModifierActive,
             missionModifierHeld,
             missionSelectionAxisValue,
@@ -23044,21 +23423,21 @@ bool VR_UpdateOpenVrControllerActions()
             missionCancelAxisActive);
 
     if (missionSelector.available &&
-        !g_vrOpenVrLoggedMissionSelector)
+        !*loggedMissionSelector)
     {
         Com_Printf(
             0,
-            "[VR][OPENVR][CONTROLS] V105 safe mission selector is "
+            "%s V105 safe mission selector is "
             "active: start with both sticks centered, hold the off-hand "
             "trigger, then move the off-hand stick; dominant-stick "
-            "movement cancels selection.\n");
-        g_vrOpenVrLoggedMissionSelector = true;
+            "movement cancels selection.\n",
+            logPrefix);
+        *loggedMissionSelector = true;
     }
 
     bool nightVisionGestureGripActive = false;
     const bool nightVisionGestureGripPressed =
-        VrInput::GetOpenVrBooleanSourceState(
-            g_vrOpenVrHands,
+        readBoolean(
             VrInput::Source::LeftSqueeze,
             &nightVisionGestureGripActive);
 
@@ -23074,7 +23453,7 @@ bool VR_UpdateOpenVrControllerActions()
                 nightVisionGesturePose.gripPose,
                 nightVisionGestureGripActive,
                 nightVisionGestureGripPressed,
-                "OpenVR/SteamVR");
+                backendLabel);
 
     for (const VrInput::ActionDefinition& action :
          VrInput::ActionDefinitions())
@@ -23125,8 +23504,7 @@ bool VR_UpdateOpenVrControllerActions()
                 if (VrInput::IsDirectionalSource(source))
                 {
                     const VrInput::OpenVrVector2 value =
-                        VrInput::GetOpenVrVector2SourceState(
-                            g_vrOpenVrHands,
+                        readVector(
                             VrInput::PhysicalSource(source),
                             &sourceActive);
                     bool& latched =
@@ -23163,8 +23541,7 @@ bool VR_UpdateOpenVrControllerActions()
                 else
                 {
                     sourceHeld =
-                        VrInput::GetOpenVrBooleanSourceState(
-                            g_vrOpenVrHands,
+                        readBoolean(
                             source,
                             &sourceActive);
                 }
@@ -23230,8 +23607,7 @@ bool VR_UpdateOpenVrControllerActions()
 
             bool sourceActive = false;
             const VrInput::OpenVrVector2 candidate =
-                VrInput::GetOpenVrVector2SourceState(
-                    g_vrOpenVrHands,
+                readVector(
                     binding.sources[0],
                     &sourceActive);
 
@@ -23269,7 +23645,7 @@ bool VR_UpdateOpenVrControllerActions()
         inputVectors,
         inputVectorActive,
         missionMovementLockHeld,
-        "OpenVR/SteamVR");
+        backendLabel);
 
     const auto isHeld = [&inputHeld](
         const VrInput::Action action)
@@ -23278,20 +23654,111 @@ bool VR_UpdateOpenVrControllerActions()
             static_cast<std::size_t>(action)];
     };
 
+    const bool rawOffhandGripHeld =
+        isHeld(VrInput::Action::SupportGrip);
+    VR_ResolveOffhandGripModes(
+        rawOffhandGripHeld,
+        supportGripHeld,
+        objectGripHeld);
+}
+
+bool VR_UpdateOpenVrControllerActions()
+{
+    if (g_vrOpenVrSystem == nullptr)
+    {
+        return false;
+    }
+
+    const std::array<VrInput::Hand, 2> handTypes = {
+        VrInput::Hand::Left,
+        VrInput::Hand::Right,
+    };
+
+    bool anyController = false;
+
+    for (std::size_t handIndex = 0u;
+         handIndex < handTypes.size();
+         ++handIndex)
+    {
+        const bool stateValid =
+            VrInput::RefreshOpenVrHandState(
+                g_vrOpenVrSystem,
+                handTypes[handIndex],
+                &g_vrOpenVrHands[handIndex]);
+
+        anyController = anyController || stateValid;
+
+        if (stateValid &&
+            !g_vrOpenVrLoggedController[handIndex])
+        {
+            const std::string description =
+                VrInput::OpenVrHandDescription(
+                    g_vrOpenVrHands[handIndex]);
+
+            Com_Printf(
+                0,
+                "[VR][OPENVR][CONTROLS] Connected %s. Legacy "
+                "SteamVR component discovery is active.\n",
+                description.c_str());
+
+            if (VrInput::IsOpenVrIndexController(
+                    g_vrOpenVrHands[handIndex]))
+            {
+                Com_Printf(
+                    0,
+                    "[VR][OPENVR][CONTROLS] V98 Index physical "
+                    "squeeze accepts either analog Axis2 or its "
+                    "digital press bit.\n");
+            }
+
+            std::snprintf(
+                g_vrCompatibilityControllerProfiles[handIndex].data(),
+                g_vrCompatibilityControllerProfiles[handIndex].size(),
+                "%s",
+                description.c_str());
+
+            g_vrOpenVrLoggedController[handIndex] = true;
+            VR_AppendCompatibilityRuntimeReceipt();
+        }
+        else if (!stateValid)
+        {
+            g_vrOpenVrLoggedController[handIndex] = false;
+            g_vrOpenVrControllerPoseComponents[handIndex] = {};
+        }
+    }
+
+    const VrConfiguratorSettings& configurable =
+        VR_GetConfiguratorSettings();
+    bool supportGripHeld = false;
+    bool objectGripHeld = false;
+    VR_ApplyLegacyControllerBindings(
+        [](const VrInput::Source source, bool* const active)
+        {
+            return VrInput::GetOpenVrBooleanSourceState(
+                g_vrOpenVrHands,
+                source,
+                active);
+        },
+        [](const VrInput::Source source, bool* const active)
+        {
+            return VrInput::GetOpenVrVector2SourceState(
+                g_vrOpenVrHands,
+                source,
+                active);
+        },
+        &g_vrOpenVrMissionSelector,
+        &g_vrOpenVrLoggedMissionSelector,
+        "[VR][OPENVR][CONTROLS]",
+        "OpenVR/SteamVR",
+        &supportGripHeld,
+        &objectGripHeld);
+
     const std::uint32_t weaponHandIndex =
         VrInteractions::WeaponControllerIndex(
             configurable.dominantHand);
     const std::uint32_t offHandIndex =
         VrInteractions::OffHandControllerIndex(
             configurable.dominantHand);
-    const bool rawOffhandGripHeld =
-        isHeld(VrInput::Action::SupportGrip);
-    bool supportGripHeld = false;
-    bool objectGripHeld = false;
-    VR_ResolveOffhandGripModes(
-        rawOffhandGripHeld,
-        &supportGripHeld,
-        &objectGripHeld);
 
     for (std::size_t handIndex = 0u;
          handIndex < g_vrOpenVrHands.size();
@@ -23805,6 +24272,516 @@ void VR_FrameOpenVr()
         g_vrCapturedStereoHeight);
 }
 
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// XrAPI positions are relative to the pose WinlatorXR captured at startup.
+// Adding the 0.5 floor-to-start altitude gives the same floor-referenced
+// standing space SteamVR uses.
+float VR_WinlatorXrFloorOffset(
+    const VrWinlatorXr::Packet& packet)
+{
+    return packet.extendedValid &&
+            std::isfinite(packet.headAltitudeMeters)
+        ? packet.headAltitudeMeters
+        : 0.0f;
+}
+
+XrPosef VR_WinlatorXrPose(
+    const std::array<float, 4>& orientation,
+    const std::array<float, 3>& position,
+    const float floorOffset)
+{
+    XrPosef pose = {};
+    pose.orientation = VR_NormalizeQuaternion({
+        orientation[0],
+        orientation[1],
+        orientation[2],
+        orientation[3],
+    });
+    pose.position = {
+        position[0],
+        position[1] + floorOffset,
+        position[2],
+    };
+    return pose;
+}
+
+bool VR_WinlatorXrOrientationValid(
+    const std::array<float, 4>& orientation)
+{
+    const float lengthSquared =
+        orientation[0] * orientation[0] +
+        orientation[1] * orientation[1] +
+        orientation[2] * orientation[2] +
+        orientation[3] * orientation[3];
+
+    return std::isfinite(lengthSquared) &&
+        lengthSquared > 0.25f;
+}
+
+XrPosef VR_UpdateWinlatorXrHeadPose(
+    const VrWinlatorXr::Packet& packet)
+{
+    const XrPosef headPose =
+        VR_WinlatorXrPose(
+            packet.headOrientation,
+            packet.headPosition,
+            VR_WinlatorXrFloorOffset(packet));
+
+    constexpr float kDefaultIpdMeters = 0.063f;
+    const float ipdMeters =
+        std::isfinite(packet.ipdMeters) &&
+                packet.ipdMeters >= 0.045f &&
+                packet.ipdMeters <= 0.085f
+            ? packet.ipdMeters
+            : kDefaultIpdMeters;
+
+    for (std::uint32_t eyeIndex = 0u;
+         eyeIndex < kVrStereoEyeCount;
+         ++eyeIndex)
+    {
+        XrPosef eyeToHeadPose = {};
+        eyeToHeadPose.orientation.w = 1.0f;
+        eyeToHeadPose.position.x =
+            (eyeIndex == 0u ? -0.5f : 0.5f) * ipdMeters;
+
+        g_vrViews[eyeIndex].pose =
+            VR_ComposePose(
+                headPose,
+                eyeToHeadPose);
+    }
+
+    g_vrWinlatorXrFloorRelative =
+        packet.extendedValid;
+
+    return headPose;
+}
+
+void VR_UpdateWinlatorXrControllers(
+    const VrWinlatorXr::Packet& packet,
+    const bool freshPacket)
+{
+    g_vrWinlatorXrHands =
+        VrWinlatorXr::HandsFromPacket(packet);
+
+    bool supportGripHeld = false;
+    bool objectGripHeld = false;
+    VR_ApplyLegacyControllerBindings(
+        [](const VrInput::Source source, bool* const active)
+        {
+            return VrWinlatorXr::GetBooleanSourceState(
+                g_vrWinlatorXrHands,
+                source,
+                active);
+        },
+        [](const VrInput::Source source, bool* const active)
+        {
+            return VrWinlatorXr::GetVector2SourceState(
+                g_vrWinlatorXrHands,
+                source,
+                active);
+        },
+        &g_vrWinlatorXrMissionSelector,
+        &g_vrWinlatorXrLoggedMissionSelector,
+        "[VR][WINLATORXR][CONTROLS]",
+        "WinlatorXR",
+        &supportGripHeld,
+        &objectGripHeld);
+
+    const VrConfiguratorSettings& configurable =
+        VR_GetConfiguratorSettings();
+    const std::uint32_t weaponHandIndex =
+        VrInteractions::WeaponControllerIndex(
+            configurable.dominantHand);
+    const std::uint32_t offHandIndex =
+        VrInteractions::OffHandControllerIndex(
+            configurable.dominantHand);
+
+    const std::uint64_t nowNanoseconds =
+        VR_OpenXrClockNanoseconds();
+    const float elapsedSeconds =
+        g_vrWinlatorXrPreviousPacketNanoseconds != 0u
+            ? static_cast<float>(
+                  static_cast<double>(
+                      nowNanoseconds -
+                      g_vrWinlatorXrPreviousPacketNanoseconds) *
+                  1.0e-9)
+            : 0.0f;
+    const bool velocityIntervalValid =
+        freshPacket &&
+        elapsedSeconds >= 0.001f &&
+        elapsedSeconds <= 0.2f;
+
+    const float floorOffset =
+        VR_WinlatorXrFloorOffset(packet);
+
+    // A 180-degree roll about the controller's forward axis.
+    constexpr XrQuaternionf kRollFlip = {0.0f, 0.0f, 1.0f, 0.0f};
+
+    for (std::uint32_t handIndex = 0u;
+         handIndex < 2u;
+         ++handIndex)
+    {
+        const bool left = handIndex == VR_CONTROLLER_LEFT;
+        const std::array<float, 4>& orientation = left
+            ? packet.leftOrientation
+            : packet.rightOrientation;
+        const std::array<float, 3>& position = left
+            ? packet.leftPosition
+            : packet.rightPosition;
+        const std::array<float, 4>& gripOrientation = left
+            ? packet.leftGripOrientation
+            : packet.rightGripOrientation;
+
+        const bool poseValid =
+            VR_WinlatorXrOrientationValid(orientation);
+
+        XrPosef aimPose =
+            VR_WinlatorXrPose(
+                orientation,
+                position,
+                floorOffset);
+        XrPosef gripPose = aimPose;
+
+        if (packet.extendedValid &&
+            VR_WinlatorXrOrientationValid(gripOrientation))
+        {
+            gripPose.orientation = VR_NormalizeQuaternion({
+                gripOrientation[0],
+                gripOrientation[1],
+                gripOrientation[2],
+                gripOrientation[3],
+            });
+        }
+
+        if (g_vrWinlatorXrControllerRollFlip)
+        {
+            aimPose.orientation =
+                VR_MultiplyQuaternion(
+                    aimPose.orientation,
+                    kRollFlip);
+            gripPose.orientation =
+                VR_MultiplyQuaternion(
+                    gripPose.orientation,
+                    kRollFlip);
+        }
+
+        XrVector3f linearVelocity = {};
+        bool linearVelocityValid = false;
+
+        if (poseValid &&
+            velocityIntervalValid &&
+            g_vrWinlatorXrPreviousControllerPositionValid[handIndex])
+        {
+            const XrVector3f& previous =
+                g_vrWinlatorXrPreviousControllerPosition[handIndex];
+            linearVelocity.x =
+                (aimPose.position.x - previous.x) / elapsedSeconds;
+            linearVelocity.y =
+                (aimPose.position.y - previous.y) / elapsedSeconds;
+            linearVelocity.z =
+                (aimPose.position.z - previous.z) / elapsedSeconds;
+            linearVelocityValid = true;
+        }
+
+        if (freshPacket)
+        {
+            g_vrWinlatorXrPreviousControllerPosition[handIndex] =
+                aimPose.position;
+            g_vrWinlatorXrPreviousControllerPositionValid[handIndex] =
+                poseValid;
+        }
+
+        VrControllerRenderPose& renderPose =
+            g_vrControllerRenderPoses[handIndex];
+        renderPose.gripValid = poseValid;
+        // XrAPI has no palm pose; the glove uses its grip-frame anatomy.
+        renderPose.palmValid = false;
+        renderPose.aimValid = poseValid;
+
+        if (poseValid)
+        {
+            renderPose.gripPose = gripPose;
+            renderPose.aimPose = aimPose;
+        }
+
+        if (handIndex == weaponHandIndex)
+        {
+            if (poseValid)
+            {
+                VR_PublishRightControllerWeaponPose(
+                    gripPose,
+                    aimPose,
+                    linearVelocity,
+                    linearVelocityValid);
+            }
+            else
+            {
+                VR_InvalidateRightControllerWeaponPose();
+            }
+        }
+        else if (handIndex == offHandIndex)
+        {
+            VR_PublishLeftControllerForegripPose(
+                gripPose,
+                poseValid,
+                objectGripHeld,
+                supportGripHeld,
+                linearVelocity,
+                linearVelocityValid);
+
+            VR_PublishLeftControllerPalmPose(
+                gripPose,
+                false);
+        }
+
+        if (poseValid &&
+            !g_vrLoggedFirstGripPose[handIndex])
+        {
+            Com_Printf(
+                0,
+                "[VR][WINLATORXR] Located first valid %s controller "
+                "pose; grip %s.\n",
+                VR_ControllerHandName(handIndex),
+                packet.extendedValid
+                    ? "uses the XrAPI 0.5 grip orientation"
+                    : "falls back to the controller orientation");
+            g_vrLoggedFirstGripPose[handIndex] = true;
+            g_vrLoggedFirstPalmPose[handIndex] = true;
+            g_vrLoggedFirstAimPose[handIndex] = true;
+        }
+    }
+
+    if (freshPacket)
+    {
+        g_vrWinlatorXrPreviousPacketNanoseconds =
+            nowNanoseconds;
+    }
+
+    VR_UpdateTwoHandWeaponTargetFromPublishedPoses();
+    VR_UpdatePoseFocusAimFromControllers();
+}
+
+unsigned int VR_WinlatorXrSyncWaitMilliseconds()
+{
+    // Long enough to cover a 72 Hz pose interval, short enough that a
+    // stalled sender cannot freeze the game.
+    static const unsigned int waitMilliseconds = []()
+    {
+        const float requested =
+            VR_ReadWinlatorXrFloatSetting(
+                "KISAK_VR_WINLATORXR_SYNC_WAIT_MS",
+                1.0f,
+                100.0f);
+        return requested > 0.0f
+            ? static_cast<unsigned int>(requested)
+            : 20u;
+    }();
+
+    return waitMilliseconds;
+}
+
+void VR_LogWinlatorXrDiagnostics(
+    const VrWinlatorXr::Packet& packet)
+{
+    if (!g_vrWinlatorXrLoggedFirstPacket)
+    {
+        Com_Printf(
+            0,
+            "[VR][WINLATORXR] First XrAPI frame: client '%s', IPD %.4f m, "
+            "FOV %.1f x %.1f deg, sync %d, 0.5 extras %s, head %.3f %.3f "
+            "%.3f, altitude %.3f m.\n",
+            packet.client.c_str(),
+            packet.ipdMeters,
+            packet.fovXDegrees,
+            packet.fovYDegrees,
+            packet.sync,
+            packet.extendedValid ? "present" : "absent",
+            packet.headPosition[0],
+            packet.headPosition[1],
+            packet.headPosition[2],
+            packet.headAltitudeMeters);
+        g_vrWinlatorXrLoggedFirstPacket = true;
+    }
+
+    std::string lastRejected;
+    const std::uint64_t rejected =
+        VrWinlatorXr::RejectedPacketCount(&lastRejected);
+    if (rejected != 0u &&
+        g_vrWinlatorXrLoggedRejectedCount == 0u)
+    {
+        Com_PrintWarning(
+            0,
+            "[VR][WINLATORXR] Ignored an XrAPI packet that did not match "
+            "the documented layout: %s\n",
+            lastRejected.c_str());
+    }
+    g_vrWinlatorXrLoggedRejectedCount = rejected;
+
+#ifdef KISAK_SP
+    static bool loggedWindowAspect = false;
+    const int displayWidth = cls.vidConfig.displayWidth;
+    const int displayHeight = cls.vidConfig.displayHeight;
+
+    if (!loggedWindowAspect &&
+        displayWidth > 1 &&
+        displayHeight > 0)
+    {
+        const float windowEyeAspect =
+            (0.5f * static_cast<float>(displayWidth)) /
+            static_cast<float>(displayHeight);
+        const float fovEyeAspect =
+            std::tan(0.5f * g_vrWinlatorXrFovXDegrees * 0.01745329251994329577f) /
+            std::tan(0.5f * g_vrWinlatorXrFovYDegrees * 0.01745329251994329577f);
+
+        if (std::fabs(windowEyeAspect / fovEyeAspect - 1.0f) > 0.03f)
+        {
+            Com_PrintWarning(
+                0,
+                "[VR][WINLATORXR] Each half of the %dx%d window has aspect "
+                "%.3f but the eye FOV needs %.3f; the image will look "
+                "stretched. Use an r_customMode near %dx%d.\n",
+                displayWidth,
+                displayHeight,
+                windowEyeAspect,
+                fovEyeAspect,
+                2 * static_cast<int>(
+                    std::lround(displayHeight * fovEyeAspect)),
+                displayHeight);
+        }
+        loggedWindowAspect = true;
+    }
+#endif
+}
+
+void VR_FrameWinlatorXr()
+{
+    if (!g_vrInitialized ||
+        !g_vrWinlatorXrInitialized ||
+        g_vrRuntimeBackend !=
+            VrRuntimeBackend::WinlatorXr ||
+        g_vrViews.size() < kVrStereoEyeCount)
+    {
+        return;
+    }
+
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR update packed UI placement");
+    VR_UpdatePackedUiScreenPlacement();
+
+    // XrAPI asks the game to hold rendering until HMD_SYNC changes. This
+    // wait is the frame pacer, like OpenVR's WaitGetPoses.
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR wait for HMD_SYNC");
+
+    VrWinlatorXr::Packet packet;
+    bool freshPacket = false;
+
+    if (!VrWinlatorXr::WaitForPacket(
+            g_vrWinlatorXrLastSync,
+            VR_WinlatorXrSyncWaitMilliseconds(),
+            &packet,
+            &freshPacket))
+    {
+        VR_SendWinlatorXrState();
+        return;
+    }
+
+    if (!freshPacket && !g_vrWinlatorXrLoggedStall)
+    {
+        Com_PrintWarning(
+            0,
+            "[VR][WINLATORXR] No new XrAPI pose within %u ms; reusing "
+            "sync %d. Further stalls are not logged.\n",
+            VR_WinlatorXrSyncWaitMilliseconds(),
+            packet.sync);
+        g_vrWinlatorXrLoggedStall = true;
+    }
+
+    g_vrWinlatorXrLastSync = packet.sync;
+    VR_LogWinlatorXrDiagnostics(packet);
+
+    if (!g_vrWinlatorXrFovOverridden &&
+        (std::fabs(packet.fovXDegrees - g_vrWinlatorXrFovXDegrees) > 0.5f ||
+         std::fabs(packet.fovYDegrees - g_vrWinlatorXrFovYDegrees) > 0.5f))
+    {
+        VR_ConfigureWinlatorXrViews(
+            packet.fovXDegrees,
+            packet.fovYDegrees);
+    }
+
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR head pose");
+    const XrPosef headPose =
+        VR_UpdateWinlatorXrHeadPose(packet);
+
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR controller input");
+    VR_UpdateWinlatorXrControllers(
+        packet,
+        freshPacket);
+
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR menu controller navigation");
+    VR_UpdateMenuControllerNavigation();
+
+    VR_PublishHeadOrientation(
+        headPose.orientation);
+
+    VR_ProcessCalibrationRequest(0);
+    VR_ProcessHudEditorRequest();
+    VR_ProcessWeaponCalibrationRequest();
+
+    // Same menu-source selection as the OpenXR/OpenVR comfort screens:
+    // frontend menus and centered modals are drawn into the left eye, the
+    // active pause menu into the right eye.
+    const bool menuComfortMode =
+        Key_IsCatcherActive(
+            0,
+            0x10);
+    const bool activePauseComfortMode =
+        menuComfortMode &&
+        !VR_IsCenteredMonoscopicMenuActive() &&
+        clientUIActives[0].connectionState ==
+            CA_ACTIVE;
+    VrWinlatorXr::SetMenuSourceEye(
+        !menuComfortMode
+            ? -1
+            : activePauseComfortMode ? 1 : 0);
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_vrPublishedRenderViewsMutex);
+
+        for (std::uint32_t eyeIndex = 0u;
+             eyeIndex < kVrStereoEyeCount;
+             ++eyeIndex)
+        {
+            g_vrPublishedRenderViews[eyeIndex] =
+                g_vrViews[eyeIndex];
+        }
+
+        g_vrPublishedRenderViewsValid = true;
+        g_vrPublishedRenderPoseNanoseconds =
+            VR_OpenXrClockNanoseconds();
+        g_vrPublishedWinlatorXrSync = packet.sync;
+    }
+
+    KisakCrash_SetStage(
+        "VR_Frame: WinlatorXR send state");
+    VR_SendWinlatorXrState();
+
+    KisakCrash_SetVrState(
+        true,
+        true,
+        static_cast<int>(
+            g_vrSessionState),
+        static_cast<unsigned int>(
+            VrWinlatorXr::ReceivedPacketCount() &
+            0xFFFFFFFFu),
+        0u,
+        0u);
+}
+
 void VR_Frame()
 {
     KisakCrash_SetVrState(
@@ -23820,6 +24797,13 @@ void VR_Frame()
         VrRuntimeBackend::OpenVr)
     {
         VR_FrameOpenVr();
+        return;
+    }
+
+    if (g_vrRuntimeBackend ==
+        VrRuntimeBackend::WinlatorXr)
+    {
+        VR_FrameWinlatorXr();
         return;
     }
 
@@ -24534,7 +25518,8 @@ void VR_Shutdown()
     VR_ResetHeadOrientation();
     if (g_vrInstance == XR_NULL_HANDLE &&
         g_vrSession == XR_NULL_HANDLE &&
-        !g_vrOpenVrInitialized)
+        !g_vrOpenVrInitialized &&
+        !g_vrWinlatorXrInitialized)
     {
         VR_ResetState();
         return;
@@ -24546,8 +25531,17 @@ void VR_Shutdown()
         VR_RuntimeBackendName());
 
     VR_D3D9CaptureSetEnabled(false);
+    VR_D3D9SetDirectPresentEnabled(false);
 
     g_vrSessionRunning = false;
+
+    if (g_vrWinlatorXrInitialized)
+    {
+        VrWinlatorXr::Stop();
+        g_vrWinlatorXrInitialized = false;
+        g_vrWinlatorXrHands = {};
+        g_vrWinlatorXrMissionSelector = {};
+    }
 
     if (g_vrOpenVrInitialized)
     {

@@ -274,6 +274,10 @@ Available values are:
   It provides headset and controller tracking plus the same configured action
   model through SteamVR's legacy controller API. Driver-specific button aliases
   may require remapping.
+- `winlatorxr` forces the experimental, untested WinlatorXR XrAPI backend for
+  standalone Quest and Pico headsets. `auto` also selects it when
+  WinlatorXR's `Z:\tmp\xr\system` file exists. See
+  [docs/WINLATORXR.md](docs/WINLATORXR.md).
 
 Changing this setting does not make SteamVR a 32-bit OpenXR runtime. Fully
 close and restart COD4 after changing it.

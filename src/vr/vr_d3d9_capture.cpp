@@ -1,4 +1,5 @@
 #include "vr/vr_d3d9_capture.h"
+#include "vr/vr_winlatorxr.h"
 #include <chrono>
 
 #include "qcommon/qcommon.h"
@@ -48,6 +49,7 @@ struct VrSharedCaptureSlot
 };
 
 std::atomic<bool> g_captureEnabled{false};
+std::atomic<bool> g_directPresentEnabled{false};
 std::atomic<bool> g_sharedBridgeActive{false};
 
 unsigned int g_captureCounter = 0u;
@@ -675,10 +677,27 @@ void VR_D3D9CaptureSetEnabled(const bool enabled)
     g_loggedDeviceLostPause = false;
 }
 
+void VR_D3D9SetDirectPresentEnabled(const bool enabled)
+{
+    g_directPresentEnabled.store(
+        enabled,
+        std::memory_order_release);
+
+    if (enabled)
+    {
+        Com_Printf(
+            0,
+            "[VR] Same-frame D3D9 stereo enabled for direct "
+            "presentation; frame capture is disabled.\n");
+    }
+}
+
 bool VR_D3D9IsSameFrameStereoEnabled()
 {
     return
         g_captureEnabled.load(
+            std::memory_order_acquire) ||
+        g_directPresentEnabled.load(
             std::memory_order_acquire);
 }
 
@@ -689,6 +708,15 @@ void VR_D3D9CaptureFrame(
     if (device == nullptr ||
         !VR_D3D9IsSameFrameStereoEnabled())
     {
+        return;
+    }
+
+    if (g_directPresentEnabled.load(
+            std::memory_order_acquire))
+    {
+        VR_WinlatorXrBeforePresent(
+            device,
+            renderFrameId);
         return;
     }
 

@@ -38,6 +38,12 @@ struct VrD3D9SharedFrame
 // Enables or disables the reset-safe, full-rate stereo capture.
 void VR_D3D9CaptureSetEnabled(bool enabled);
 
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// Same-frame stereo without capture: the packed side-by-side backbuffer is
+// presented to the window as-is, for runtimes that display the window
+// itself. Only the WinlatorXR sync pixel is stamped before Present().
+void VR_D3D9SetDirectPresentEnabled(bool enabled);
+
 // Used by the renderer frontend/backend to gate same-frame stereo.
 bool VR_D3D9IsSameFrameStereoEnabled();
 
