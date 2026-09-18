@@ -2762,6 +2762,16 @@ int main(const int argumentCount, char** arguments)
             runtime.find(
                 "VR_UpdatePoseFocusAimFromControllers();",
                 openVrTwoHandUpdate);
+        const std::size_t winlatorXrControllerUpdate =
+            runtime.find("void VR_UpdateWinlatorXrControllers(");
+        const std::size_t winlatorXrTwoHandUpdate =
+            runtime.find(
+                "VR_UpdateTwoHandWeaponTargetFromPublishedPoses();",
+                winlatorXrControllerUpdate);
+        const std::size_t winlatorXrFocusUpdate =
+            runtime.find(
+                "VR_UpdatePoseFocusAimFromControllers();",
+                winlatorXrTwoHandUpdate);
         Check(
             runtime.find(
                 "void VR_UpdateTwoHandWeaponTargetFromPublishedPoses()") !=
@@ -2769,7 +2779,7 @@ int main(const int argumentCount, char** arguments)
                 CountOccurrences(
                     runtime,
                     "VR_UpdateTwoHandWeaponTargetFromPublishedPoses();") ==
-                    2u &&
+                    3u &&
                 openVrControllerUpdate != std::string::npos &&
                 openVrTwoHandUpdate != std::string::npos &&
                 openVrFocusUpdate != std::string::npos &&
@@ -2777,8 +2787,13 @@ int main(const int argumentCount, char** arguments)
                     "V66 backend-shared two-hand weapon") !=
                     std::string::npos &&
                 openVrControllerUpdate < openVrTwoHandUpdate &&
-                openVrTwoHandUpdate < openVrFocusUpdate,
-            "issue #26: OpenXR and OpenVR must both update the shared two-hand weapon target after publishing controller poses");
+                openVrTwoHandUpdate < openVrFocusUpdate &&
+                winlatorXrControllerUpdate != std::string::npos &&
+                winlatorXrTwoHandUpdate != std::string::npos &&
+                winlatorXrFocusUpdate != std::string::npos &&
+                winlatorXrControllerUpdate < winlatorXrTwoHandUpdate &&
+                winlatorXrTwoHandUpdate < winlatorXrFocusUpdate,
+            "issue #26: OpenXR, OpenVR, and WinlatorXR must all update the shared two-hand weapon target after publishing controller poses");
         Check(
                 runtime.find(
                     "KISAK_SP_VR_NIGHT_VISION_VISOR_GESTURE_V80") !=
@@ -3953,7 +3968,7 @@ int main(const int argumentCount, char** arguments)
                     "uiEyeWidth,\n        displayHeight);") == 3u &&
                 CountOccurrences(
                     runtime,
-                    "VR_UpdatePackedUiScreenPlacement();") == 4u &&
+                    "VR_UpdatePackedUiScreenPlacement();") == 6u &&
                 runtime.find(
                     "one %d x %d eye") !=
                     std::string::npos &&

@@ -341,8 +341,9 @@ bool Start(std::string* const error)
 
     g_systemInfo = ParseSystemInfo(ReadTextFile(kSystemPath));
 
+    // Winsock 2.2. q_shared.h undefines MAKEWORD.
     WSADATA wsaData = {};
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    if (WSAStartup(0x0202u, &wsaData) != 0)
     {
         return fail("WSAStartup failed.");
     }

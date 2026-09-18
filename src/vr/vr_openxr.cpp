@@ -23372,7 +23372,7 @@ void VR_ApplyLegacyControllerBindings(
     const VectorReader& readVector,
     VrInput::OpenVrMissionSelectorState* const missionSelectorState,
     bool* const loggedMissionSelector,
-    const char* const logPrefix,
+    const char* const missionSelectorMessage,
     const char* const backendLabel,
     bool* const supportGripHeld,
     bool* const objectGripHeld)
@@ -23427,11 +23427,8 @@ void VR_ApplyLegacyControllerBindings(
     {
         Com_Printf(
             0,
-            "%s V105 safe mission selector is "
-            "active: start with both sticks centered, hold the off-hand "
-            "trigger, then move the off-hand stick; dominant-stick "
-            "movement cancels selection.\n",
-            logPrefix);
+            "%s",
+            missionSelectorMessage);
         *loggedMissionSelector = true;
     }
 
@@ -23748,7 +23745,10 @@ bool VR_UpdateOpenVrControllerActions()
         },
         &g_vrOpenVrMissionSelector,
         &g_vrOpenVrLoggedMissionSelector,
-        "[VR][OPENVR][CONTROLS]",
+        "[VR][OPENVR][CONTROLS] V105 safe mission selector is "
+        "active: start with both sticks centered, hold the off-hand "
+        "trigger, then move the off-hand stick; dominant-stick "
+        "movement cancels selection.\n",
         "OpenVR/SteamVR",
         &supportGripHeld,
         &objectGripHeld);
@@ -24382,7 +24382,10 @@ void VR_UpdateWinlatorXrControllers(
         },
         &g_vrWinlatorXrMissionSelector,
         &g_vrWinlatorXrLoggedMissionSelector,
-        "[VR][WINLATORXR][CONTROLS]",
+        "[VR][WINLATORXR][CONTROLS] V105 safe mission selector is "
+        "active: start with both sticks centered, hold the off-hand "
+        "trigger, then move the off-hand stick; dominant-stick "
+        "movement cancels selection.\n",
         "WinlatorXR",
         &supportGripHeld,
         &objectGripHeld);
