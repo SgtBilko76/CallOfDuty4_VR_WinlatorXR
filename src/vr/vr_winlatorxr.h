@@ -2,6 +2,7 @@
 
 #include "vr/vr_winlatorxr_protocol.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -49,12 +50,33 @@ void RecordRenderFrameSync(
     std::uint32_t renderFrameId,
     int sync);
 
-// The OpenXR and OpenVR compositors show menus as a mono quad sampled from
-// the one eye the UI was drawn into (left for frontend menus and modals,
-// right for the active pause menu). Direct presentation has no compositor,
-// so the eye is copied into a centered 4:3 panel in both window halves before
-// Present(). -1 disables the copy.
-void SetMenuSourceEye(int eyeIndex);
+// A flat image shown on a virtual screen fixed in the room. Direct
+// presentation has no compositor layers, so menus (drawn into one eye) and
+// cinematics (drawn across the whole window) are copied from the packed
+// backbuffer and drawn as a perspective-correct quad in each eye before
+// Present().
+struct VirtualScreen
+{
+    bool active = false;
+
+    // Source rectangle in the packed backbuffer, normalized to its size.
+    float sourceLeft = 0.0f;
+    float sourceTop = 0.0f;
+    float sourceRight = 1.0f;
+    float sourceBottom = 1.0f;
+
+    // The screen is split into a grid so no vertex lands far outside an eye
+    // image, where rasterizers may drop pre-transformed geometry. Per eye,
+    // each grid point (row-major from the top-left) holds normalized
+    // eye-image coordinates u, v and 1/depth; depth <= 0 marks a point
+    // behind the eye.
+    static constexpr std::size_t kGridCells = 8u;
+    static constexpr std::size_t kGridPoints =
+        (kGridCells + 1u) * (kGridCells + 1u);
+    std::array<std::array<std::array<float, 3>, kGridPoints>, 2> grid = {};
+};
+
+void SetVirtualScreen(const VirtualScreen& screen);
 
 } // namespace kisak::vr::winlatorxr
 

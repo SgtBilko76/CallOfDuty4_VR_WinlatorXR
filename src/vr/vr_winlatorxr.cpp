@@ -68,14 +68,11 @@ std::size_t g_renderFrameSyncWriteIndex = 0u;
 
 bool g_loggedStampFailure = false;
 bool g_loggedFirstStamp = false;
-bool g_loggedMenuFailure = false;
-bool g_loggedFirstMenu = false;
+bool g_loggedScreenFailure = false;
+bool g_loggedFirstScreen = false;
 
-std::atomic<int> g_menuSourceEye{-1};
-
-// Fraction of each eye's width used by the mono menu panel.
-constexpr float kMenuPanelWidthFraction = 0.8f;
-constexpr float kMenuPanelAspect = 4.0f / 3.0f;
+std::mutex g_screenMutex;
+VirtualScreen g_virtualScreen;
 
 bool DirectoryExists(const char* path)
 {
@@ -209,13 +206,25 @@ void ReceiveLoop()
     }
 }
 
-// Copies the eye that holds the menu into a centered 4:3 panel in both
-// halves. The temporary render target is released immediately so it never
-// blocks a legacy IDirect3DDevice9::Reset().
-HRESULT PresentMonoMenu(
+struct ScreenVertex
+{
+    float x;
+    float y;
+    float z;
+    float rhw;
+    float u;
+    float v;
+};
+
+// Copies the screen's source rectangle into a texture, clears the window,
+// and draws that texture as a perspective-correct quad in each eye. The
+// temporary texture is released immediately so it never blocks a legacy
+// IDirect3DDevice9::Reset(); render targets and all device state are
+// restored so the renderer's own state cache stays valid.
+HRESULT PresentVirtualScreen(
     IDirect3DDevice9* const device,
     IDirect3DSurface9* const backBuffer,
-    const int sourceEye)
+    const VirtualScreen& screen)
 {
     D3DSURFACE_DESC description = {};
     HRESULT hr = backBuffer->GetDesc(&description);
@@ -224,57 +233,49 @@ HRESULT PresentMonoMenu(
         return hr;
     }
 
-    const LONG eyeWidth = static_cast<LONG>(description.Width / 2u);
-    const LONG eyeHeight = static_cast<LONG>(description.Height);
-    if (eyeWidth < 16 || eyeHeight < 16)
+    const float windowWidth = static_cast<float>(description.Width);
+    const float windowHeight = static_cast<float>(description.Height);
+    const float eyeWidth = windowWidth * 0.5f;
+
+    const RECT sourceRect = {
+        static_cast<LONG>(screen.sourceLeft * windowWidth),
+        static_cast<LONG>(screen.sourceTop * windowHeight),
+        static_cast<LONG>(screen.sourceRight * windowWidth),
+        static_cast<LONG>(screen.sourceBottom * windowHeight),
+    };
+    const LONG sourceWidth = sourceRect.right - sourceRect.left;
+    const LONG sourceHeight = sourceRect.bottom - sourceRect.top;
+    if (sourceWidth < 16 || sourceHeight < 16)
     {
         return S_OK;
     }
 
-    IDirect3DSurface9* menuCopy = nullptr;
-    hr = device->CreateRenderTarget(
-        static_cast<UINT>(eyeWidth),
-        static_cast<UINT>(eyeHeight),
+    IDirect3DTexture9* screenTexture = nullptr;
+    hr = device->CreateTexture(
+        static_cast<UINT>(sourceWidth),
+        static_cast<UINT>(sourceHeight),
+        1u,
+        D3DUSAGE_RENDERTARGET,
         description.Format,
-        D3DMULTISAMPLE_NONE,
-        0u,
-        FALSE,
-        &menuCopy,
+        D3DPOOL_DEFAULT,
+        &screenTexture,
         nullptr);
     if (FAILED(hr))
     {
         return hr;
     }
 
-    const RECT sourceRect = {
-        sourceEye == 1 ? eyeWidth : 0,
-        0,
-        sourceEye == 1 ? 2 * eyeWidth : eyeWidth,
-        eyeHeight,
-    };
-
-    hr = device->StretchRect(
-        backBuffer,
-        &sourceRect,
-        menuCopy,
-        nullptr,
-        D3DTEXF_NONE);
-
-    LONG panelWidth = static_cast<LONG>(
-        static_cast<float>(eyeWidth) * kMenuPanelWidthFraction);
-    LONG panelHeight = static_cast<LONG>(
-        static_cast<float>(panelWidth) / kMenuPanelAspect);
-    const LONG maximumPanelHeight = static_cast<LONG>(
-        static_cast<float>(eyeHeight) * kMenuPanelWidthFraction);
-    if (panelHeight > maximumPanelHeight)
+    IDirect3DSurface9* screenSurface = nullptr;
+    hr = screenTexture->GetSurfaceLevel(0u, &screenSurface);
+    if (SUCCEEDED(hr))
     {
-        panelHeight = maximumPanelHeight;
-        panelWidth = static_cast<LONG>(
-            static_cast<float>(panelHeight) * kMenuPanelAspect);
+        hr = device->StretchRect(
+            backBuffer,
+            &sourceRect,
+            screenSurface,
+            nullptr,
+            D3DTEXF_NONE);
     }
-
-    const LONG panelLeft = (eyeWidth - panelWidth) / 2;
-    const LONG panelTop = (eyeHeight - panelHeight) / 2;
 
     if (SUCCEEDED(hr))
     {
@@ -284,24 +285,168 @@ HRESULT PresentMonoMenu(
             D3DCOLOR_XRGB(0, 0, 0));
     }
 
-    for (LONG eye = 0; eye < 2 && SUCCEEDED(hr); ++eye)
-    {
-        const RECT panelRect = {
-            eye * eyeWidth + panelLeft,
-            panelTop,
-            eye * eyeWidth + panelLeft + panelWidth,
-            panelTop + panelHeight,
-        };
+    IDirect3DStateBlock9* savedState = nullptr;
+    IDirect3DSurface9* savedTarget = nullptr;
+    IDirect3DSurface9* savedDepth = nullptr;
 
-        hr = device->StretchRect(
-            menuCopy,
-            nullptr,
-            backBuffer,
-            &panelRect,
-            D3DTEXF_LINEAR);
+    if (SUCCEEDED(hr))
+    {
+        hr = device->CreateStateBlock(D3DSBT_ALL, &savedState);
     }
 
-    menuCopy->Release();
+    if (SUCCEEDED(hr))
+    {
+        device->GetRenderTarget(0u, &savedTarget);
+        device->GetDepthStencilSurface(&savedDepth);
+
+        device->SetRenderTarget(0u, backBuffer);
+        device->SetDepthStencilSurface(nullptr);
+
+        const D3DVIEWPORT9 viewport = {
+            0u,
+            0u,
+            description.Width,
+            description.Height,
+            0.0f,
+            1.0f,
+        };
+        device->SetViewport(&viewport);
+
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        device->SetTexture(0u, screenTexture);
+        device->SetTextureStageState(0u, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0u, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0u, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        device->SetTextureStageState(0u, D3DTSS_TEXCOORDINDEX, 0u);
+        device->SetTextureStageState(0u, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        device->SetTextureStageState(1u, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetSamplerState(0u, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0u, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0u, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(0u, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(0u, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(0u, D3DSAMP_SRGBTEXTURE, FALSE);
+        device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xFu);
+        device->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+
+        // Present runs after the frame's EndScene; open a scene only when
+        // the renderer has none open.
+        const bool ownScene = SUCCEEDED(device->BeginScene());
+
+        constexpr std::size_t kCells = VirtualScreen::kGridCells;
+        constexpr std::size_t kRow = kCells + 1u;
+        std::array<ScreenVertex, kCells * kCells * 6u> vertices = {};
+
+        for (std::size_t eye = 0u; eye < 2u && SUCCEEDED(hr); ++eye)
+        {
+            const float eyeLeft = static_cast<float>(eye) * eyeWidth;
+            const auto& grid = screen.grid[eye];
+
+            std::size_t vertexCount = 0u;
+            for (std::size_t row = 0u; row < kCells; ++row)
+            {
+                for (std::size_t column = 0u; column < kCells; ++column)
+                {
+                    const std::size_t cell[4] = {
+                        row * kRow + column,
+                        row * kRow + column + 1u,
+                        (row + 1u) * kRow + column + 1u,
+                        (row + 1u) * kRow + column,
+                    };
+
+                    bool behind = false;
+                    bool allLeft = true;
+                    bool allRight = true;
+                    bool allAbove = true;
+                    bool allBelow = true;
+                    for (const std::size_t point : cell)
+                    {
+                        behind = behind || !(grid[point][2] > 0.0f);
+                        allLeft = allLeft && grid[point][0] < 0.0f;
+                        allRight = allRight && grid[point][0] > 1.0f;
+                        allAbove = allAbove && grid[point][1] < 0.0f;
+                        allBelow = allBelow && grid[point][1] > 1.0f;
+                    }
+
+                    if (behind || allLeft || allRight || allAbove || allBelow)
+                    {
+                        continue;
+                    }
+
+                    static const std::size_t kTriangles[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+                    for (const std::size_t corner : kTriangles)
+                    {
+                        const std::size_t point = cell[corner];
+                        ScreenVertex& vertex = vertices[vertexCount++];
+                        vertex.x = eyeLeft + grid[point][0] * eyeWidth - 0.5f;
+                        vertex.y = grid[point][1] * windowHeight - 0.5f;
+                        vertex.z = 0.5f;
+                        vertex.rhw = grid[point][2];
+                        vertex.u = static_cast<float>(point % kRow) / kCells;
+                        vertex.v = static_cast<float>(point / kRow) / kCells;
+                    }
+                }
+            }
+
+            if (vertexCount == 0u)
+            {
+                continue;
+            }
+
+            const RECT scissor = {
+                static_cast<LONG>(eyeLeft),
+                0,
+                static_cast<LONG>(eyeLeft + eyeWidth),
+                static_cast<LONG>(windowHeight),
+            };
+            device->SetScissorRect(&scissor);
+
+            hr = device->DrawPrimitiveUP(
+                D3DPT_TRIANGLELIST,
+                static_cast<UINT>(vertexCount / 3u),
+                vertices.data(),
+                sizeof(ScreenVertex));
+        }
+
+        if (ownScene)
+        {
+            device->EndScene();
+        }
+
+        device->SetTexture(0u, nullptr);
+        device->SetRenderTarget(0u, savedTarget);
+        device->SetDepthStencilSurface(savedDepth);
+        savedState->Apply();
+    }
+
+    if (savedDepth != nullptr)
+    {
+        savedDepth->Release();
+    }
+    if (savedTarget != nullptr)
+    {
+        savedTarget->Release();
+    }
+    if (savedState != nullptr)
+    {
+        savedState->Release();
+    }
+    if (screenSurface != nullptr)
+    {
+        screenSurface->Release();
+    }
+    screenTexture->Release();
     return hr;
 }
 
@@ -392,9 +537,12 @@ bool Start(std::string* const error)
 
     g_loggedStampFailure = false;
     g_loggedFirstStamp = false;
-    g_loggedMenuFailure = false;
-    g_loggedFirstMenu = false;
-    g_menuSourceEye.store(-1, std::memory_order_release);
+    g_loggedScreenFailure = false;
+    g_loggedFirstScreen = false;
+    {
+        std::lock_guard<std::mutex> lock(g_screenMutex);
+        g_virtualScreen = {};
+    }
     g_stopRequested.store(false, std::memory_order_release);
     g_receiveThread = std::thread(ReceiveLoop);
     g_running.store(true, std::memory_order_release);
@@ -545,11 +693,10 @@ void SendState(const StatePacket& state)
         sizeof(address));
 }
 
-void SetMenuSourceEye(const int eyeIndex)
+void SetVirtualScreen(const VirtualScreen& screen)
 {
-    g_menuSourceEye.store(
-        eyeIndex == 0 || eyeIndex == 1 ? eyeIndex : -1,
-        std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_screenMutex);
+    g_virtualScreen = screen;
 }
 
 void RecordRenderFrameSync(
@@ -621,32 +768,37 @@ void VR_WinlatorXrBeforePresent(
         D3DBACKBUFFER_TYPE_MONO,
         &backBuffer);
 
-    const int menuSourceEye =
-        wxr::g_menuSourceEye.load(std::memory_order_acquire);
-
-    if (SUCCEEDED(hr) && backBuffer != nullptr && menuSourceEye >= 0)
+    wxr::VirtualScreen screen;
     {
-        const HRESULT menuResult =
-            wxr::PresentMonoMenu(device, backBuffer, menuSourceEye);
+        std::lock_guard<std::mutex> lock(wxr::g_screenMutex);
+        screen = wxr::g_virtualScreen;
+    }
 
-        if (FAILED(menuResult) && !wxr::g_loggedMenuFailure)
+    if (SUCCEEDED(hr) && backBuffer != nullptr && screen.active)
+    {
+        const HRESULT screenResult =
+            wxr::PresentVirtualScreen(device, backBuffer, screen);
+
+        if (FAILED(screenResult) && !wxr::g_loggedScreenFailure)
         {
             Com_PrintWarning(
                 0,
-                "[VR][WINLATORXR] Could not copy the menu eye into both "
-                "window halves (HRESULT 0x%08X); menus may appear in one "
-                "eye only.\n",
-                static_cast<unsigned int>(menuResult));
-            wxr::g_loggedMenuFailure = true;
+                "[VR][WINLATORXR] Could not draw the virtual screen "
+                "(HRESULT 0x%08X); menus and videos may look split.\n",
+                static_cast<unsigned int>(screenResult));
+            wxr::g_loggedScreenFailure = true;
         }
-        else if (SUCCEEDED(menuResult) && !wxr::g_loggedFirstMenu)
+        else if (SUCCEEDED(screenResult) && !wxr::g_loggedFirstScreen)
         {
             Com_Printf(
                 0,
-                "[VR][WINLATORXR] Presented the %s-eye menu as a centered "
-                "4:3 panel in both eyes.\n",
-                menuSourceEye == 1 ? "right" : "left");
-            wxr::g_loggedFirstMenu = true;
+                "[VR][WINLATORXR] Drew the first room-fixed virtual screen "
+                "(source %.2f-%.2f x %.2f-%.2f of the window).\n",
+                screen.sourceLeft,
+                screen.sourceRight,
+                screen.sourceTop,
+                screen.sourceBottom);
+            wxr::g_loggedFirstScreen = true;
         }
     }
 

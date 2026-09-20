@@ -3,6 +3,9 @@
 #endif
 
 #include "cg_servercmds.h"
+#if defined(KISAK_OPENXR_ENABLED)
+#include "vr/vr_openxr.h"
+#endif
 #include <client/client.h>
 #include <qcommon/com_bsp.h>
 #include <gfx_d3d/r_dpvs.h>
@@ -354,6 +357,25 @@ void __cdecl CG_OpenScriptMenu(int localClientNum)
         Cbuf_AddText(localClientNum, v11);
         return;
     }
+#if defined(KISAK_SP) && defined(KISAK_OPENXR_ENABLED)
+    // KISAK_SP_VR_SKIP_INVERT_AXIS_PROMPT_V118
+    // F.N.G.'s look training asks whether to invert the look axis and blocks
+    // until the menu answers. Head tracking makes the question meaningless,
+    // and the popup is awkward to answer in the headset. Answer it with the
+    // menu's own "keep current controls" response on the next frame.
+    if (VR_IsInitialized() &&
+        (!I_stricmp(ConfigString, "invert_axis_pc") ||
+         !I_stricmp(ConfigString, "invert_axis")))
+    {
+        Com_Printf(
+            0,
+            "[VR][CAMPAIGN] V118 answered the '%s' look-inversion prompt with "
+            "accept_normal; head tracking controls the view.\n",
+            ConfigString);
+        Cbuf_AddText(localClientNum, va("cmd mr %i accept_normal\n", v5));
+        return;
+    }
+#endif
     if (Cmd_Argc() <= 2 || !Cmd_Argv(2) || (v7 = 0, !*Cmd_Argv(2)))
         v7 = 1;
     if (!UI_PopupScriptMenu(ConfigString, v7))

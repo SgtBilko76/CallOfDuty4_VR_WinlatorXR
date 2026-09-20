@@ -5,6 +5,8 @@
 #include "win_local.h"
 #include <universal/timing.h>
 
+#include <cmath>
+
 void Sys_DetectVideoCard(int descLimit, char* description)
 {
     _D3DADAPTER_IDENTIFIER9 id;
@@ -230,7 +232,20 @@ void Sys_SetAutoConfigureGHz(SysInfo* sysInfo)
         multiCpuFactor = 2.0;
     }
 
-    sysInfo->configureGHz = Sys_BenchmarkGHz() * multiCpuFactor;
+    // KISAK_SP_VR_WINLATORXR_XRAPI_V1
+    // Box64 emulates rdtsc from a coarse hardware counter, so the benchmark
+    // can time zero ticks and return +inf. That value cannot be archived, so
+    // every launch saw "changed hardware" and blocked on the autoconfigure
+    // prompt. Fall back to the measured clock speed.
+    double benchmarkGHz = Sys_BenchmarkGHz();
+    if (!std::isfinite(benchmarkGHz) || benchmarkGHz <= 0.0 || benchmarkGHz > 100.0)
+    {
+        benchmarkGHz = sysInfo->cpuGHz > 0.0 && std::isfinite(sysInfo->cpuGHz)
+            ? sysInfo->cpuGHz
+            : 2.0;
+    }
+
+    sysInfo->configureGHz = benchmarkGHz * multiCpuFactor;
 }
 
 void __cdecl Sys_DetectCpuVendorAndName(char *vendor, char *name)

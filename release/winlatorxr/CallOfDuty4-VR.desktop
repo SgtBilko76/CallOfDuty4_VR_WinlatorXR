@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=CallOfDuty4-VR
+Exec=wine C:\\\\windows\\\\system32\\\\cmd.exe
+Type=Application
+StartupWMClass=KisakCOD-sp.exe
+
+[Extra Data]
+container_id=4
+screenSize=2388x1080
+execArgs=/c D:\CallOfDuty4\Launch-KisakCOD-VR-WinlatorXR.bat

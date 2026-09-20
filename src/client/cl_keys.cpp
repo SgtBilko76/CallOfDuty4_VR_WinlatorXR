@@ -23,6 +23,11 @@
 #endif
 #include <universal/profile.h>
 
+#ifdef KISAK_SP
+#include "vr/vr_openxr.h"
+#include <cstring>
+#endif
+
 
 keyname_t keynames[96] =
 {
@@ -1762,6 +1767,30 @@ void __cdecl CL_KeyEvent(int32_t localClientNum, int32_t key, int32_t down, uint
 void __cdecl CL_KeyEvent(int32_t localClientNum, int32_t key, int32_t down, uint32_t time)
 {
     PROF_SCOPED("CL_KeyEvent");
+
+    // KISAK_SP_VR_WINLATORXR_XRAPI_V1
+    // WinlatorXR also turns controller buttons into desktop key and mouse
+    // events (A becomes the 'a' strafe-left key). The controllers already
+    // reach the game through XrAPI, so drop desktop keys during gameplay.
+    // Menus, the console, Escape, and the console key keep working.
+    if (clientUIActives[0].keyCatchers == 0 &&
+        key != 27 &&
+        !CL_IsConsoleKey(key) &&
+        VR_IsInitialized() &&
+        std::strcmp(VR_GetActiveBackendName(), "WinlatorXR") == 0)
+    {
+        static bool loggedWinlatorXrKeySuppressed = false;
+        if (!loggedWinlatorXrKeySuppressed)
+        {
+            Com_Printf(
+                0,
+                "[VR][WINLATORXR][INPUT] Ignoring desktop key and mouse-button "
+                "events during VR gameplay; WinlatorXR's controller-to-keyboard "
+                "emulation would otherwise duplicate XrAPI buttons.\n");
+            loggedWinlatorXrKeySuppressed = true;
+        }
+        return;
+    }
 
     const char *v4; // eax
     KeyState *keys; // [esp+34h] [ebp-41Ch]

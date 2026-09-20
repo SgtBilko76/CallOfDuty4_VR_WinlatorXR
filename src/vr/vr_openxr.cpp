@@ -12,10 +12,12 @@
 #include "vr/vr_weapon_profiles.h"
 #include "vr/vr_winlatorxr.h"
 #include "client/client.h"
+#include "qcommon/cmd.h"
 
 void __cdecl UI_MouseEvent(int localClientNum, int x, int y);
 #include "vr/vr_d3d9_capture.h"
 #include "vr/vr_d3d9ex_interop_probe.h"
+#include "gfx_d3d/r_cinematic.h"
 #include "gfx_d3d/r_init.h"
 
 #include "qcommon/qcommon.h"
@@ -1457,8 +1459,13 @@ bool VR_ParseHandedBinding(
     return VrInput::ParseBinding(action, value, binding);
 }
 
+// keepMenuButtonActions: WinlatorXR reports the left Menu button separately
+// from Y, so Pause and Next weapon keep their defaults (Menu and Y) instead
+// of OpenVR's Y and right-stick-click, which WinlatorXR reserves for its own
+// menu.
 bool VR_ApplyOpenVrSafeBindingCompatibility(
-    VrConfiguratorSettings* const settings)
+    VrConfiguratorSettings* const settings,
+    const bool keepMenuButtonActions = false)
 {
     if (settings == nullptr)
     {
@@ -1498,6 +1505,13 @@ bool VR_ApplyOpenVrSafeBindingCompatibility(
     for (const VrInput::BindingLayoutEntry& layout :
          VrInput::OpenVrSafeBindingLayout())
     {
+        if (keepMenuButtonActions &&
+            (layout.action == VrInput::Action::PauseMenu ||
+             layout.action == VrInput::Action::NextWeapon))
+        {
+            continue;
+        }
+
         const std::size_t actionIndex =
             static_cast<std::size_t>(layout.action);
         VR_ParseHandedBinding(
@@ -2071,13 +2085,14 @@ const VrConfiguratorSettings& VR_GetConfiguratorSettings()
         g_vrRuntimeBackend == VrRuntimeBackend::WinlatorXr)
     {
         openVrCompatibilityChecked = true;
-        if (VR_ApplyOpenVrSafeBindingCompatibility(&settings))
+        if (VR_ApplyOpenVrSafeBindingCompatibility(&settings, true))
         {
             Com_Printf(
                 0,
                 "[VR][WINLATORXR][CONTROLS] V105 upgraded the untouched "
                 "portable defaults to the safe off-hand trigger selector "
-                "because XrAPI has no thumbrest.\n");
+                "because XrAPI has no thumbrest; Pause stays on Menu and "
+                "Next weapon on Y.\n");
         }
     }
 
@@ -17075,6 +17090,29 @@ void VR_UpdateManualMagazineReload(
             "[VR][RELOAD] Inserted weapon %d magazine; "
             "committing ammo transfer.\n",
             weaponIndex);
+
+        // KISAK_SP_VR_FNG_RELOAD_NOTIFY_BRIDGE_V117
+        // F.N.G.'s keyHint("reload") waits for a native +reload command
+        // through notifyOnCommand, like the V74 hip-fire hint waits for
+        // +attack. A physical magazine insert never issues +reload, so the
+        // tutorial stalled. Notify the same script listeners on each
+        // committed insert without touching the keyboard button state.
+        int matchedNotifications =
+            Cmd_NotifyVirtualCommand("+reload");
+        const char* notifiedCommand = "+reload";
+        if (matchedNotifications == 0)
+        {
+            matchedNotifications =
+                Cmd_NotifyVirtualCommand("+usereload");
+            notifiedCommand = "+usereload";
+        }
+
+        Com_Printf(
+            0,
+            "[VR][RELOAD] V117 physical insert notified %d %s script "
+            "listener(s).\n",
+            matchedNotifications,
+            notifiedCommand);
     }
 
     if (applyInsertHaptic)
@@ -24417,8 +24455,16 @@ void VR_UpdateWinlatorXrControllers(
     const float floorOffset =
         VR_WinlatorXrFloorOffset(packet);
 
-    // A 180-degree roll about the controller's forward axis.
-    constexpr XrQuaternionf kRollFlip = {0.0f, 0.0f, 1.0f, 0.0f};
+    // XrAPI's controller quaternion is rolled 180 degrees about the pointing
+    // axis relative to an OpenXR aim pose; HWXR applies the same roll to
+    // every device. XrAPI 0.5's "upward" grip quaternion is that corrected
+    // aim pitched up 60 degrees and does not match an OpenXR grip: replaying
+    // a Quest 3 capture, the free glove only looked natural with the grip
+    // taken from the corrected aim. KISAK_VR_WINLATORXR_GRIP_PITCH tilts it.
+    constexpr XrQuaternionf kAimRollCorrection = {0.0f, 0.0f, 1.0f, 0.0f};
+    // HWXR's additional upside-down hands fix for Quest 2 and Pico class
+    // devices: a 180-degree turn about the controller's X axis.
+    constexpr XrQuaternionf kUpsideDownFix = {1.0f, 0.0f, 0.0f, 0.0f};
 
     for (std::uint32_t handIndex = 0u;
          handIndex < 2u;
@@ -24431,9 +24477,6 @@ void VR_UpdateWinlatorXrControllers(
         const std::array<float, 3>& position = left
             ? packet.leftPosition
             : packet.rightPosition;
-        const std::array<float, 4>& gripOrientation = left
-            ? packet.leftGripOrientation
-            : packet.rightGripOrientation;
 
         const bool poseValid =
             VR_WinlatorXrOrientationValid(orientation);
@@ -24443,17 +24486,27 @@ void VR_UpdateWinlatorXrControllers(
                 orientation,
                 position,
                 floorOffset);
+        aimPose.orientation =
+            VR_MultiplyQuaternion(
+                aimPose.orientation,
+                kAimRollCorrection);
+
         XrPosef gripPose = aimPose;
 
-        if (packet.extendedValid &&
-            VR_WinlatorXrOrientationValid(gripOrientation))
+        static const float gripPitchDegrees =
+            VR_ReadWinlatorXrFloatSetting(
+                "KISAK_VR_WINLATORXR_GRIP_PITCH",
+                -90.0f,
+                90.0f);
+
+        if (gripPitchDegrees != 0.0f)
         {
-            gripPose.orientation = VR_NormalizeQuaternion({
-                gripOrientation[0],
-                gripOrientation[1],
-                gripOrientation[2],
-                gripOrientation[3],
-            });
+            const float half =
+                0.5f * gripPitchDegrees * 0.01745329251994329577f;
+            gripPose.orientation =
+                VR_MultiplyQuaternion(
+                    aimPose.orientation,
+                    {std::sin(half), 0.0f, 0.0f, std::cos(half)});
         }
 
         if (g_vrWinlatorXrControllerRollFlip)
@@ -24461,11 +24514,11 @@ void VR_UpdateWinlatorXrControllers(
             aimPose.orientation =
                 VR_MultiplyQuaternion(
                     aimPose.orientation,
-                    kRollFlip);
+                    kUpsideDownFix);
             gripPose.orientation =
                 VR_MultiplyQuaternion(
                     gripPose.orientation,
-                    kRollFlip);
+                    kUpsideDownFix);
         }
 
         XrVector3f linearVelocity = {};
@@ -24497,13 +24550,60 @@ void VR_UpdateWinlatorXrControllers(
         VrControllerRenderPose& renderPose =
             g_vrControllerRenderPoses[handIndex];
         renderPose.gripValid = poseValid;
-        // XrAPI has no palm pose; the glove uses its grip-frame anatomy.
-        renderPose.palmValid = false;
+        // XrAPI has no palm pose, and the free glove is an open hand: with
+        // grip-frame anatomy (+Y wrist-to-fingertips) it stands upright on a
+        // forward-pointing controller. Derive an XR_EXT_palm_pose frame
+        // instead: -Z along the straightened fingers (the aim direction) and
+        // +X away from the left palm / into the right palm, i.e. the aim
+        // frame rolled 180 degrees for the left hand and unchanged for the
+        // right hand.
+        XrPosef palmPose = aimPose;
+        palmPose.position = gripPose.position;
+        if (left)
+        {
+            palmPose.orientation =
+                VR_MultiplyQuaternion(
+                    aimPose.orientation,
+                    kAimRollCorrection);
+        }
+
+        // On the Quest the glove still showed its palm upward with a
+        // normally held controller; players asked for it rolled 180 degrees.
+        // KISAK_VR_WINLATORXR_OFFHAND_ROLL adjusts the roll about the
+        // fingers (default 180, "0" keeps the derived palm frame).
+        static const float offhandRollDegrees = []()
+        {
+            const char* const value =
+                std::getenv("KISAK_VR_WINLATORXR_OFFHAND_ROLL");
+            if (value == nullptr || value[0] == '\0')
+            {
+                return 180.0f;
+            }
+            const float parsed = std::strtof(value, nullptr);
+            return std::isfinite(parsed) && parsed >= -360.0f &&
+                    parsed <= 360.0f
+                ? parsed
+                : 180.0f;
+        }();
+
+        if (handIndex == offHandIndex &&
+            offhandRollDegrees != 0.0f)
+        {
+            const float half =
+                0.5f * offhandRollDegrees * 0.01745329251994329577f;
+            palmPose.orientation =
+                VR_MultiplyQuaternion(
+                    palmPose.orientation,
+                    {0.0f, 0.0f, std::sin(half), std::cos(half)});
+        }
+
+        renderPose.palmValid = poseValid;
         renderPose.aimValid = poseValid;
 
         if (poseValid)
         {
             renderPose.gripPose = gripPose;
+            renderPose.palmPose = palmPose;
             renderPose.aimPose = aimPose;
         }
 
@@ -24533,8 +24633,8 @@ void VR_UpdateWinlatorXrControllers(
                 linearVelocityValid);
 
             VR_PublishLeftControllerPalmPose(
-                gripPose,
-                false);
+                palmPose,
+                poseValid);
         }
 
         if (poseValid &&
@@ -24543,11 +24643,10 @@ void VR_UpdateWinlatorXrControllers(
             Com_Printf(
                 0,
                 "[VR][WINLATORXR] Located first valid %s controller "
-                "pose; grip %s.\n",
+                "pose; grip is the roll-corrected aim pitched %.0f "
+                "degrees; the free glove uses a derived palm pose.\n",
                 VR_ControllerHandName(handIndex),
-                packet.extendedValid
-                    ? "uses the XrAPI 0.5 grip orientation"
-                    : "falls back to the controller orientation");
+                gripPitchDegrees);
             g_vrLoggedFirstGripPose[handIndex] = true;
             g_vrLoggedFirstPalmPose[handIndex] = true;
             g_vrLoggedFirstAimPose[handIndex] = true;
@@ -24656,6 +24755,340 @@ void VR_LogWinlatorXrDiagnostics(
 #endif
 }
 
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// Menus and cinematics have no compositor layer under WinlatorXR. Pin them
+// to a virtual screen in front of the player (yaw only), anchored when the
+// screen first appears, and project its corners into each eye for the render
+// thread. Frontend menus and centered modals are drawn into the left eye,
+// the active pause menu into the right eye, and cinematics across the whole
+// window.
+void VR_UpdateWinlatorXrVirtualScreen(
+    const XrPosef& headPose)
+{
+    constexpr float kScreenDistanceMeters = 2.0f;
+    constexpr float kScreenWidthMeters = 2.4f;
+    constexpr float kNearestPointMeters = 0.05f;
+
+    // Keep the anchor across short gaps, e.g. between intro clips, so the
+    // screen does not jump when the next clip or a menu follows.
+    constexpr std::uint64_t kAnchorKeepNanoseconds = 1000000000ull;
+
+    static bool anchorValid = false;
+    static XrVector3f anchorCenter = {};
+    static XrVector3f anchorRight = {};
+    static std::uint64_t lastActiveNanoseconds = 0u;
+
+    const bool menuActive =
+        Key_IsCatcherActive(
+            0,
+            0x10);
+    const connstate_t connectionState =
+        clientUIActives[0].connectionState;
+    const bool videoPlaying =
+        R_Cinematic_IsStarted() &&
+        !R_Cinematic_IsFinished();
+    const bool cinematicActive =
+        connectionState == CA_CINEMATIC ||
+        connectionState == CA_LOGO ||
+        (videoPlaying && !menuActive);
+
+    static int loggedState = -1;
+    const int state =
+        (menuActive ? 1 : 0) |
+        (videoPlaying ? 2 : 0) |
+        (static_cast<int>(connectionState) << 2);
+    if (state != loggedState)
+    {
+        Com_Printf(
+            0,
+            "[VR][WINLATORXR] Screen state: menu %d, video %d, "
+            "connection state %d.\n",
+            menuActive ? 1 : 0,
+            videoPlaying ? 1 : 0,
+            static_cast<int>(connectionState));
+        loggedState = state;
+    }
+
+    VrWinlatorXr::VirtualScreen screen;
+    float aspect = 4.0f / 3.0f;
+
+    if (cinematicActive)
+    {
+        aspect = 16.0f / 9.0f;
+    }
+    else if (menuActive)
+    {
+        const bool activePause =
+            !VR_IsCenteredMonoscopicMenuActive() &&
+            connectionState == CA_ACTIVE;
+        screen.sourceLeft = activePause ? 0.5f : 0.0f;
+        screen.sourceRight = activePause ? 1.0f : 0.5f;
+    }
+    else
+    {
+        if (anchorValid &&
+            VR_OpenXrClockNanoseconds() - lastActiveNanoseconds >
+                kAnchorKeepNanoseconds)
+        {
+            anchorValid = false;
+        }
+        VrWinlatorXr::SetVirtualScreen(screen);
+        return;
+    }
+
+    screen.active = true;
+    lastActiveNanoseconds = VR_OpenXrClockNanoseconds();
+
+    if (!anchorValid)
+    {
+        const VrHeadVector forward =
+            VR_RotateHeadVector(
+                headPose.orientation,
+                {0.0f, 0.0f, -1.0f});
+        float forwardX = forward.x;
+        float forwardZ = forward.z;
+        const float length =
+            std::sqrt(forwardX * forwardX + forwardZ * forwardZ);
+        if (length < 0.01f)
+        {
+            forwardX = 0.0f;
+            forwardZ = -1.0f;
+        }
+        else
+        {
+            forwardX /= length;
+            forwardZ /= length;
+        }
+
+        anchorCenter = {
+            headPose.position.x + forwardX * kScreenDistanceMeters,
+            headPose.position.y,
+            headPose.position.z + forwardZ * kScreenDistanceMeters,
+        };
+        anchorRight = {-forwardZ, 0.0f, forwardX};
+        anchorValid = true;
+
+        Com_Printf(
+            0,
+            "[VR][WINLATORXR] Anchored a %.1f m %s virtual screen %.1f m "
+            "ahead for the %s.\n",
+            kScreenWidthMeters,
+            cinematicActive ? "16:9" : "4:3",
+            kScreenDistanceMeters,
+            cinematicActive ? "cinematic" : "menu");
+    }
+
+    const float halfWidth = 0.5f * kScreenWidthMeters;
+    const float halfHeight = 0.5f * kScreenWidthMeters / aspect;
+
+    constexpr std::size_t kCells = VrWinlatorXr::VirtualScreen::kGridCells;
+
+    for (std::uint32_t eyeIndex = 0u;
+         eyeIndex < kVrStereoEyeCount;
+         ++eyeIndex)
+    {
+        const XrView& view = g_vrViews[eyeIndex];
+        const XrQuaternionf inverseEye =
+            VR_ConjugateQuaternion(view.pose.orientation);
+        const float tanLeft = std::tan(view.fov.angleLeft);
+        const float tanRight = std::tan(view.fov.angleRight);
+        const float tanUp = std::tan(view.fov.angleUp);
+        const float tanDown = std::tan(view.fov.angleDown);
+
+        for (std::size_t row = 0u; row <= kCells; ++row)
+        {
+            for (std::size_t column = 0u; column <= kCells; ++column)
+            {
+                // Row 0 is the top edge, column 0 the left edge.
+                const float sideways =
+                    (2.0f * column / kCells - 1.0f) * halfWidth;
+                const float upward =
+                    (1.0f - 2.0f * row / kCells) * halfHeight;
+                const VrHeadVector local =
+                    VR_RotateHeadVector(
+                        inverseEye,
+                        {
+                            anchorCenter.x + anchorRight.x * sideways -
+                                view.pose.position.x,
+                            anchorCenter.y + upward -
+                                view.pose.position.y,
+                            anchorCenter.z + anchorRight.z * sideways -
+                                view.pose.position.z,
+                        });
+
+                std::array<float, 3>& point =
+                    screen.grid[eyeIndex][row * (kCells + 1u) + column];
+
+                // OpenXR eye space looks down -Z.
+                const float depth = -local.z;
+                if (!(depth > kNearestPointMeters))
+                {
+                    point = {0.0f, 0.0f, 0.0f};
+                    continue;
+                }
+
+                point = {
+                    (local.x / depth - tanLeft) / (tanRight - tanLeft),
+                    (tanUp - local.y / depth) / (tanUp - tanDown),
+                    1.0f / depth,
+                };
+            }
+        }
+    }
+
+    VrWinlatorXr::SetVirtualScreen(screen);
+}
+
+// Verbose-diagnostics only: every 2 s, log pacing, the raw XrAPI poses and
+// buttons, and where each published hand ended up relative to the head.
+void VR_LogWinlatorXrTrackingDiagnostics(
+    const VrWinlatorXr::Packet& packet,
+    const XrPosef& headPose,
+    const bool freshPacket)
+{
+    if (!VR_VerboseDiagnosticsEnabled())
+    {
+        return;
+    }
+
+    // Log every XrAPI button edge; short presses fall between the 2 s
+    // snapshots below.
+    static const char* const kButtonNames[VrWinlatorXr::kButtonCount] = {
+        "L_GRIP", "L_MENU", "L_STICK_PRESS", "L_STICK_LEFT", "L_STICK_RIGHT",
+        "L_STICK_UP", "L_STICK_DOWN", "L_TRIGGER", "L_X", "L_Y", "R_A", "R_B",
+        "R_GRIP", "R_STICK_PRESS", "R_STICK_LEFT", "R_STICK_RIGHT",
+        "R_STICK_UP", "R_STICK_DOWN", "R_TRIGGER",
+    };
+    static std::array<bool, VrWinlatorXr::kButtonCount> previousButtons = {};
+    for (std::size_t button = 0u;
+         button < VrWinlatorXr::kButtonCount;
+         ++button)
+    {
+        if (packet.buttons[button] != previousButtons[button])
+        {
+            Com_Printf(
+                0,
+                "[VR][WINLATORXR][DIAG] %s %s (sync %d)\n",
+                kButtonNames[button],
+                packet.buttons[button] ? "pressed" : "released",
+                packet.sync);
+            previousButtons[button] = packet.buttons[button];
+        }
+    }
+
+    static std::uint64_t windowStartNanoseconds = 0u;
+    static std::uint32_t windowFrames = 0u;
+    static std::uint32_t windowFreshPackets = 0u;
+
+    const std::uint64_t nowNanoseconds =
+        VR_OpenXrClockNanoseconds();
+    if (windowStartNanoseconds == 0u)
+    {
+        windowStartNanoseconds = nowNanoseconds;
+    }
+
+    ++windowFrames;
+    if (freshPacket)
+    {
+        ++windowFreshPackets;
+    }
+
+    const std::uint64_t elapsedNanoseconds =
+        nowNanoseconds - windowStartNanoseconds;
+    if (elapsedNanoseconds < 2000000000ull)
+    {
+        return;
+    }
+
+    const double seconds =
+        static_cast<double>(elapsedNanoseconds) * 1.0e-9;
+
+    std::array<char, VrWinlatorXr::kButtonCount + 1u> buttons = {};
+    for (std::size_t button = 0u;
+         button < VrWinlatorXr::kButtonCount;
+         ++button)
+    {
+        buttons[button] = packet.buttons[button] ? 'T' : 'F';
+    }
+
+    Com_Printf(
+        0,
+        "[VR][WINLATORXR][DIAG] %.1f frames/s, %.1f new poses/s, sync %d; "
+        "head pos %.3f %.3f %.3f quat %.3f %.3f %.3f %.3f; buttons %s; "
+        "sticks L %.2f %.2f R %.2f %.2f\n",
+        windowFrames / seconds,
+        windowFreshPackets / seconds,
+        packet.sync,
+        headPose.position.x,
+        headPose.position.y,
+        headPose.position.z,
+        headPose.orientation.x,
+        headPose.orientation.y,
+        headPose.orientation.z,
+        headPose.orientation.w,
+        buttons.data(),
+        packet.leftThumbstick[0],
+        packet.leftThumbstick[1],
+        packet.rightThumbstick[0],
+        packet.rightThumbstick[1]);
+
+    const XrQuaternionf inverseHead =
+        VR_ConjugateQuaternion(headPose.orientation);
+
+    for (std::uint32_t handIndex = 0u;
+         handIndex < 2u;
+         ++handIndex)
+    {
+        const bool left = handIndex == VR_CONTROLLER_LEFT;
+        const std::array<float, 3>& position = left
+            ? packet.leftPosition
+            : packet.rightPosition;
+        const std::array<float, 4>& orientation = left
+            ? packet.leftOrientation
+            : packet.rightOrientation;
+        const std::array<float, 4>& gripOrientation = left
+            ? packet.leftGripOrientation
+            : packet.rightGripOrientation;
+        const VrControllerRenderPose& renderPose =
+            g_vrControllerRenderPoses[handIndex];
+
+        // Head-local OpenXR axes: +X right, +Y up, +Z back.
+        const VrHeadVector local = VR_RotateHeadVector(
+            inverseHead,
+            {
+                renderPose.gripPose.position.x - headPose.position.x,
+                renderPose.gripPose.position.y - headPose.position.y,
+                renderPose.gripPose.position.z - headPose.position.z,
+            });
+
+        Com_Printf(
+            0,
+            "[VR][WINLATORXR][DIAG] %s raw pos %.3f %.3f %.3f quat %.3f %.3f "
+            "%.3f %.3f grip quat %.3f %.3f %.3f %.3f; published grip %s, "
+            "head-local right %.2f up %.2f back %.2f m\n",
+            left ? "left" : "right",
+            position[0],
+            position[1],
+            position[2],
+            orientation[0],
+            orientation[1],
+            orientation[2],
+            orientation[3],
+            gripOrientation[0],
+            gripOrientation[1],
+            gripOrientation[2],
+            gripOrientation[3],
+            renderPose.gripValid ? "valid" : "invalid",
+            local.x,
+            local.y,
+            local.z);
+    }
+
+    windowStartNanoseconds = nowNanoseconds;
+    windowFrames = 0u;
+    windowFreshPackets = 0u;
+}
+
 void VR_FrameWinlatorXr()
 {
     if (!g_vrInitialized ||
@@ -24723,6 +25156,11 @@ void VR_FrameWinlatorXr()
         packet,
         freshPacket);
 
+    VR_LogWinlatorXrTrackingDiagnostics(
+        packet,
+        headPose,
+        freshPacket);
+
     KisakCrash_SetStage(
         "VR_Frame: WinlatorXR menu controller navigation");
     VR_UpdateMenuControllerNavigation();
@@ -24734,22 +25172,8 @@ void VR_FrameWinlatorXr()
     VR_ProcessHudEditorRequest();
     VR_ProcessWeaponCalibrationRequest();
 
-    // Same menu-source selection as the OpenXR/OpenVR comfort screens:
-    // frontend menus and centered modals are drawn into the left eye, the
-    // active pause menu into the right eye.
-    const bool menuComfortMode =
-        Key_IsCatcherActive(
-            0,
-            0x10);
-    const bool activePauseComfortMode =
-        menuComfortMode &&
-        !VR_IsCenteredMonoscopicMenuActive() &&
-        clientUIActives[0].connectionState ==
-            CA_ACTIVE;
-    VrWinlatorXr::SetMenuSourceEye(
-        !menuComfortMode
-            ? -1
-            : activePauseComfortMode ? 1 : 0);
+    VR_UpdateWinlatorXrVirtualScreen(
+        headPose);
 
     {
         std::lock_guard<std::mutex> lock(

@@ -558,6 +558,34 @@ void __cdecl Com_SetRecommended(int localClientNum, int restart)
     }
 }
 
+// KISAK_SP_VR_WINLATORXR_XRAPI_V1
+// Inside a WinlatorXR container these blocking desktop prompts open behind
+// the game's splash window, where they cannot be reached from the headset.
+// Accept the recommended autoconfigure there, as the prompt itself advises.
+bool __cdecl Sys_AutoAcceptConfigurePrompts(const char *prompt)
+{
+    char backend[16] = {};
+    const DWORD length = GetEnvironmentVariableA("KISAK_VR_BACKEND", backend, sizeof(backend));
+    bool accept = false;
+
+    if (length > 0 && length < sizeof(backend) && _stricmp(backend, "auto") != 0)
+    {
+        accept = _stricmp(backend, "winlatorxr") == 0;
+    }
+    else
+    {
+        const DWORD attributes = GetFileAttributesA("Z:\\tmp\\xr\\system");
+        accept = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    if (accept)
+    {
+        Com_Printf(16, "[VR][WINLATORXR] Accepted the '%s' autoconfigure prompt without a desktop dialog.\n", prompt);
+    }
+
+    return accept;
+}
+
 bool __cdecl Sys_ShouldUpdateForInfoChange()
 {
     HWND ActiveWindow; // eax
@@ -565,6 +593,8 @@ bool __cdecl Sys_ShouldUpdateForInfoChange()
     char *v3; // [esp-8h] [ebp-8h]
 
     Sys_ArchiveInfo(0);
+    if (Sys_AutoAcceptConfigurePrompts("computer changed"))
+        return true;
     v3 = Win_LocalizeRef("WIN_COMPUTER_CHANGE_TITLE");
     v2 = Win_LocalizeRef("WIN_COMPUTER_CHANGE_BODY");
     ActiveWindow = GetActiveWindow();
@@ -577,6 +607,8 @@ bool __cdecl Sys_ShouldUpdateForConfigChange()
     char *v2; // [esp-Ch] [ebp-Ch]
     char *v3; // [esp-8h] [ebp-8h]
 
+    if (Sys_AutoAcceptConfigurePrompts("configure updated"))
+        return true;
     v3 = Win_LocalizeRef("WIN_CONFIGURE_UPDATED_TITLE");
     v2 = Win_LocalizeRef("WIN_CONFIGURE_UPDATED_BODY");
     ActiveWindow = GetActiveWindow();
