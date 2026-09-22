@@ -1,5 +1,8 @@
 # KisakCOD VR
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-SgtBilko76-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/SgtBilko76)
+
+
 KisakCOD VR is a single-player OpenXR VR conversion for the original 2007
 Windows release of Call of Duty 4: Modern Warfare. It adds stereoscopic
 rendering, 6DoF headset tracking, motion-controller weapon aiming, physical
